@@ -1,10 +1,12 @@
 # app_erp.py
 # =============================================================================
-# ERP Financeiro - PyQt5
+# ERP Financeiro - PyQt5 (com máscaras, ícones e exportar PDF/Excel)
 # =============================================================================
 
 import os
 import sys
+import csv
+import re
 import sqlite3
 from pathlib import Path
 from datetime import date
@@ -14,18 +16,124 @@ try:
 except Exception:
     from secrets import compare_digest as secure_eq
 
-from PyQt5.QtCore import Qt, QDate
+from PyQt5.QtCore import Qt, QDate, QRegExp
+from PyQt5.QtGui import QRegExpValidator, QIcon, QPainter, QTextDocument
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QLabel, QComboBox, QLineEdit, QPushButton, QHBoxLayout,
     QVBoxLayout, QFormLayout, QMessageBox, QMainWindow, QAction, QDialog, QTableWidget,
-    QTableWidgetItem, QHeaderView, QGroupBox, QSpinBox, QDateEdit, QCheckBox, QRadioButton
+    QTableWidgetItem, QHeaderView, QGroupBox, QSpinBox, QDateEdit, QCheckBox, QRadioButton,
+    QFileDialog, QStyledItemDelegate
 )
+from PyQt5.QtPrintSupport import QPrinter
 
 DB_FILE = "erp_financeiro.db"
 APP_TITLE = "ERP Financeiro"
 
 # ----------------------------------------------------------------------------- 
-# Esquema (idêntico ao do init_db.py).
+# Utilidades: formatação e validação BR
+# -----------------------------------------------------------------------------
+UF_SET = {
+    "AC","AL","AP","AM","BA","CE","DF","ES","GO","MA","MT","MS","MG","PA",
+    "PB","PR","PE","PI","RJ","RN","RS","RO","RR","SC","SP","SE","TO"
+}
+
+def only_digits(s: str) -> str:
+    return "".join(ch for ch in (s or "") if ch.isdigit())
+
+def format_cnpj(d: str) -> str:
+    d = only_digits(d)
+    if len(d) != 14:
+        return d
+    return f"{d[0:2]}.{d[2:5]}.{d[5:8]}/{d[8:12]}-{d[12:14]}"
+
+def format_cpf(d: str) -> str:
+    d = only_digits(d)
+    if len(d) != 11:
+        return d
+    return f"{d[0:3]}.{d[3:6]}.{d[6:9]}-{d[9:11]}"
+
+def validate_cnpj(cnpj: str) -> bool:
+    d = only_digits(cnpj)
+    if len(d) != 14 or d == d[0] * 14:
+        return False
+    def dv(nums, weights):
+        total = sum(int(n)*w for n, w in zip(nums, weights))
+        r = total % 11
+        return '0' if r < 2 else str(11 - r)
+    w1 = [5,4,3,2,9,8,7,6,5,4,3,2]
+    w2 = [6] + w1
+    dig1 = dv(d[:12], w1)
+    dig2 = dv(d[:12] + dig1, w2)
+    return d[-2:] == dig1 + dig2
+
+def validate_cpf(cpf: str) -> bool:
+    d = only_digits(cpf)
+    if len(d) != 11 or d == d[0] * 11:
+        return False
+    def dv(nums, m):
+        s = sum((int(nums[i]) * (m - i) for i in range(len(nums))))
+        r = (s * 10) % 11
+        return '0' if r == 10 else str(r)
+    dig1 = dv(d[:9], 10)
+    dig2 = dv(d[:9] + dig1, 11)
+    return d[-2:] == dig1 + dig2
+
+def validate_cep(cep: str) -> bool:
+    return len(only_digits(cep)) == 8
+
+def validate_uf(uf: str) -> bool:
+    return (uf or "").upper() in UF_SET
+
+# ----------------------------------------------------------------------------- 
+# Delegates para máscaras no QTableWidget
+# -----------------------------------------------------------------------------
+class MaskDelegate(QStyledItemDelegate):
+    """Delegate genérico para aplicar máscara e/ou regex numa célula."""
+    def __init__(self, mask: str = None, regex: str = None, uppercase: bool = False, parent=None):
+        super().__init__(parent)
+        self.mask = mask
+        self.regex = regex
+        self.uppercase = uppercase
+
+    def createEditor(self, parent, option, index):
+        ed = QLineEdit(parent)
+        if self.mask:
+            ed.setInputMask(self.mask)
+        if self.regex:
+            ed.setValidator(QRegExpValidator(QRegExp(self.regex), ed))
+        return ed
+
+    def setEditorData(self, editor, index):
+        editor.setText(index.data() or "")
+
+    def setModelData(self, editor, model, index):
+        text = editor.text()
+        if self.uppercase:
+            text = text.upper()
+        model.setData(index, text)
+
+class DocNumberDelegate(QStyledItemDelegate):
+    """Aceita CPF ou CNPJ; formata ao sair do editor."""
+    def createEditor(self, parent, option, index):
+        ed = QLineEdit(parent)
+        # permite dígitos e separadores comuns
+        ed.setValidator(QRegExpValidator(QRegExp(r"[0-9\.\-\/]*"), ed))
+        return ed
+
+    def setEditorData(self, editor, index):
+        editor.setText(index.data() or "")
+
+    def setModelData(self, editor, model, index):
+        text = editor.text()
+        d = only_digits(text)
+        if len(d) == 11:
+            text = format_cpf(d)
+        elif len(d) == 14:
+            text = format_cnpj(d)
+        model.setData(index, text)
+
+# ----------------------------------------------------------------------------- 
+# Esquema do banco
 # -----------------------------------------------------------------------------
 SCHEMA_SQL = r"""
 PRAGMA foreign_keys = ON;
@@ -482,9 +590,7 @@ class DB:
             self.e("INSERT INTO user_company_access(user_id, company_id) VALUES(?,?)", (user_id, cid))
         self.e("DELETE FROM user_permissions WHERE user_id=?", (user_id,))
         perm_ids = self.q("SELECT id, code FROM permission_types")
-        code_to_id = {}
-        for p in perm_ids:
-            code_to_id[p["code"]] = p["id"]
+        code_to_id = {p["code"]: p["id"] for p in perm_ids}
         for code, allowed in data["perms"].items():
             self.e("INSERT INTO user_permissions(user_id, perm_id, allowed) VALUES(?,?,?)",
                    (user_id, code_to_id[code], 1 if allowed else 0))
@@ -633,10 +739,7 @@ class DB:
 
     # DRE
     def dre(self, company_id, ano, mes=None, regime='COMPETENCIA'):
-        if regime == 'COMPETENCIA':
-            src = "vw_dre_competencia"
-        else:
-            src = "vw_dre_caixa"
+        src = "vw_dre_competencia" if regime == 'COMPETENCIA' else "vw_dre_caixa"
         params = [company_id, str(ano)]
         filt = ""
         if mes:
@@ -654,6 +757,9 @@ class DB:
 # -----------------------------------------------------------------------------
 # Helpers UI
 # -----------------------------------------------------------------------------
+def std_icon(widget, sp):
+    return widget.style().standardIcon(sp)
+
 def msg_info(text, parent=None):
     QMessageBox.information(parent, APP_TITLE, text)
 
@@ -665,6 +771,75 @@ def msg_yesno(text, parent=None):
 
 def qdate_to_iso(qd: QDate) -> str:
     return f"{qd.year():04d}-{qd.month():02d}-{qd.day():02d}"
+
+def table_to_html(table: QTableWidget, title: str) -> str:
+    head = "<tr>" + "".join(f"<th>{table.horizontalHeaderItem(c).text()}</th>" for c in range(table.columnCount())) + "</tr>"
+    rows = []
+    for r in range(table.rowCount()):
+        tds = []
+        for c in range(table.columnCount()):
+            item = table.item(r, c)
+            tds.append(f"<td>{'' if item is None else item.text()}</td>")
+        rows.append("<tr>" + "".join(tds) + "</tr>")
+    style = """
+    <style>
+    body { font-family: Arial, Helvetica, sans-serif; font-size: 12px; }
+    h2 { margin-bottom: 8px; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #888; padding: 4px 6px; }
+    th { background: #eee; }
+    </style>
+    """
+    return f"<!doctype html><html><head>{style}</head><body><h2>{title}</h2><table>{head}{''.join(rows)}</table></body></html>"
+
+def export_pdf_from_table(parent, table: QTableWidget, title: str):
+    fn, _ = QFileDialog.getSaveFileName(parent, "Salvar PDF", f"{title}.pdf", "PDF (*.pdf)")
+    if not fn:
+        return
+    html = table_to_html(table, title)
+    doc = QTextDocument()
+    doc.setHtml(html)
+    printer = QPrinter(QPrinter.HighResolution)
+    printer.setOutputFormat(QPrinter.PdfFormat)
+    if not fn.lower().endswith(".pdf"):
+        fn += ".pdf"
+    printer.setOutputFileName(fn)
+    doc.print_(printer)
+    msg_info(f"PDF gerado em:\n{fn}", parent)
+
+def export_excel_from_table(parent, table: QTableWidget, title: str):
+    # tenta xlsxwriter; se não houver, cai para CSV
+    try:
+        import xlsxwriter  # type: ignore
+        fn, _ = QFileDialog.getSaveFileName(parent, "Salvar Excel", f"{title}.xlsx", "Excel (*.xlsx)")
+        if not fn:
+            return
+        if not fn.lower().endswith(".xlsx"):
+            fn += ".xlsx"
+        wb = xlsxwriter.Workbook(fn)
+        ws = wb.add_worksheet("Dados")
+        # cabeçalhos
+        for c in range(table.columnCount()):
+            ws.write(0, c, table.horizontalHeaderItem(c).text())
+        # linhas
+        for r in range(table.rowCount()):
+            for c in range(table.columnCount()):
+                item = table.item(r, c)
+                ws.write(r+1, c, "" if item is None else item.text())
+        wb.close()
+        msg_info(f"Planilha Excel gerada em:\n{fn}", parent)
+    except Exception:
+        fn, _ = QFileDialog.getSaveFileName(parent, "Salvar CSV (Excel)", f"{title}.csv", "CSV (*.csv)")
+        if not fn:
+            return
+        if not fn.lower().endswith(".csv"):
+            fn += ".csv"
+        with open(fn, "w", newline="", encoding="utf-8") as f:
+            wr = csv.writer(f, delimiter=';')
+            wr.writerow([table.horizontalHeaderItem(c).text() for c in range(table.columnCount())])
+            for r in range(table.rowCount()):
+                wr.writerow([(table.item(r, c).text() if table.item(r, c) else "") for c in range(table.columnCount())])
+        msg_info(f"Arquivo CSV gerado em:\n{fn}\n(Excel abre normalmente)", parent)
 
 # -----------------------------------------------------------------------------
 # Diálogos
@@ -681,6 +856,7 @@ class AdminAuthDialog(QDialog):
         form.addRow("Usuário:", self.edUser)
         form.addRow("Senha:", self.edPass)
         bt = QPushButton("Validar")
+        bt.setIcon(std_icon(self, self.style().SP_DialogApplyButton))
         bt.clicked.connect(self.validate)
         form.addRow(bt)
         self.ok = False
@@ -713,10 +889,19 @@ class CompaniesDialog(QDialog):
             "ID","CNPJ","Razão Social","Contato1","Contato2","Rua","Bairro","Nº","CEP","UF","Cidade","Email"
         ])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        # Delegates/máscaras
+        self.table.setItemDelegateForColumn(1, MaskDelegate(mask="00.000.000/0000-00", parent=self))
+        self.table.setItemDelegateForColumn(8, MaskDelegate(mask="00000-000", parent=self))
+        self.table.setItemDelegateForColumn(9, MaskDelegate(regex=r"[A-Za-z]{0,2}", uppercase=True, parent=self))
+
         btAdd = QPushButton("Novo")
+        btAdd.setIcon(std_icon(self, self.style().SP_FileDialogNewFolder))
         btSave = QPushButton("Salvar")
+        btSave.setIcon(std_icon(self, self.style().SP_DialogSaveButton))
         btDel = QPushButton("Excluir")
+        btDel.setIcon(std_icon(self, self.style().SP_TrashIcon))
         btReload = QPushButton("Recarregar")
+        btReload.setIcon(std_icon(self, self.style().SP_BrowserReload))
         btAdd.clicked.connect(self.add)
         btSave.clicked.connect(self.save)
         btDel.clicked.connect(self.delete)
@@ -724,10 +909,7 @@ class CompaniesDialog(QDialog):
         lay = QVBoxLayout(self)
         lay.addWidget(self.table)
         hl = QHBoxLayout()
-        hl.addWidget(btAdd)
-        hl.addWidget(btSave)
-        hl.addWidget(btDel)
-        hl.addWidget(btReload)
+        hl.addWidget(btAdd); hl.addWidget(btSave); hl.addWidget(btDel); hl.addWidget(btReload)
         lay.addLayout(hl)
         self.load()
 
@@ -738,8 +920,8 @@ class CompaniesDialog(QDialog):
             row = self.table.rowCount()
             self.table.insertRow(row)
             data = [
-                r["id"], r["cnpj"], r["razao_social"], r["contato1"], r["contato2"], r["rua"], r["bairro"], r["numero"],
-                r["cep"], r["uf"], r["cidade"], r["email"]
+                r["id"], format_cnpj(r["cnpj"] or ""), r["razao_social"], r["contato1"], r["contato2"], r["rua"], r["bairro"], r["numero"],
+                r["cep"], (r["uf"] or ""), r["cidade"], r["email"]
             ]
             for c, val in enumerate(data):
                 item = QTableWidgetItem("" if val is None else str(val))
@@ -755,16 +937,28 @@ class CompaniesDialog(QDialog):
     def save(self):
         for r in range(self.table.rowCount()):
             id_txt = self.table.item(r, 0).text() if self.table.item(r, 0) else ""
+            cnpj = self.table.item(r, 1).text() if self.table.item(r, 1) else ""
+            cep  = self.table.item(r, 8).text() if self.table.item(r, 8) else ""
+            uf   = self.table.item(r, 9).text().upper() if self.table.item(r, 9) else ""
+            if cnpj and not validate_cnpj(cnpj):
+                msg_err(f"CNPJ inválido na linha {r+1}.")
+                return
+            if cep and not validate_cep(cep):
+                msg_err(f"CEP inválido na linha {r+1}.")
+                return
+            if uf and not validate_uf(uf):
+                msg_err(f"UF inválida na linha {r+1}. Use sigla (ex.: MS).")
+                return
             rec = dict(
-                cnpj=self.table.item(r, 1).text() if self.table.item(r, 1) else "",
+                cnpj=only_digits(cnpj),
                 razao=self.table.item(r, 2).text() if self.table.item(r, 2) else "",
                 contato1=self.table.item(r, 3).text() if self.table.item(r, 3) else "",
                 contato2=self.table.item(r, 4).text() if self.table.item(r, 4) else "",
                 rua=self.table.item(r, 5).text() if self.table.item(r, 5) else "",
                 bairro=self.table.item(r, 6).text() if self.table.item(r, 6) else "",
                 numero=self.table.item(r, 7).text() if self.table.item(r, 7) else "",
-                cep=self.table.item(r, 8).text() if self.table.item(r, 8) else "",
-                uf=self.table.item(r, 9).text() if self.table.item(r, 9) else "",
+                cep=only_digits(cep),
+                uf=uf,
                 cidade=self.table.item(r, 10).text() if self.table.item(r, 10) else "",
                 email=self.table.item(r, 11).text() if self.table.item(r, 11) else "",
                 active=1
@@ -831,9 +1025,13 @@ class UsersDialog(QDialog):
             vperm.addWidget(chk)
 
         btNovo = QPushButton("Novo")
+        btNovo.setIcon(std_icon(self, self.style().SP_FileDialogNewFolder))
         btSalvar = QPushButton("Salvar")
+        btSalvar.setIcon(std_icon(self, self.style().SP_DialogSaveButton))
         btExcluir = QPushButton("Excluir")
+        btExcluir.setIcon(std_icon(self, self.style().SP_TrashIcon))
         btReset = QPushButton("Definir/Resetar Senha")
+        btReset.setIcon(std_icon(self, self.style().SP_BrowserReload))
         btNovo.clicked.connect(self.new_user)
         btSalvar.clicked.connect(self.save_user)
         btExcluir.clicked.connect(self.delete_user)
@@ -853,10 +1051,7 @@ class UsersDialog(QDialog):
         lay.addLayout(form)
         lay.addLayout(hl)
         hl2 = QHBoxLayout()
-        hl2.addWidget(btNovo)
-        hl2.addWidget(btSalvar)
-        hl2.addWidget(btExcluir)
-        hl2.addWidget(btReset)
+        hl2.addWidget(btNovo); hl2.addWidget(btSalvar); hl2.addWidget(btExcluir); hl2.addWidget(btReset)
         lay.addLayout(hl2)
         self.populate()
 
@@ -965,9 +1160,13 @@ class BanksDialog(QDialog):
         ])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         btAdd = QPushButton("Novo")
+        btAdd.setIcon(std_icon(self, self.style().SP_FileDialogNewFolder))
         btSave = QPushButton("Salvar")
+        btSave.setIcon(std_icon(self, self.style().SP_DialogSaveButton))
         btDel = QPushButton("Excluir")
+        btDel.setIcon(std_icon(self, self.style().SP_TrashIcon))
         btReload = QPushButton("Recarregar")
+        btReload.setIcon(std_icon(self, self.style().SP_BrowserReload))
         btAdd.clicked.connect(self.add)
         btSave.clicked.connect(self.save)
         btDel.clicked.connect(self.delete)
@@ -975,10 +1174,7 @@ class BanksDialog(QDialog):
         lay = QVBoxLayout(self)
         lay.addWidget(self.table)
         hl = QHBoxLayout()
-        hl.addWidget(btAdd)
-        hl.addWidget(btSave)
-        hl.addWidget(btDel)
-        hl.addWidget(btReload)
+        hl.addWidget(btAdd); hl.addWidget(btSave); hl.addWidget(btDel); hl.addWidget(btReload)
         lay.addLayout(hl)
         self.load()
 
@@ -1043,18 +1239,26 @@ class EntitiesDialog(QDialog):
     def __init__(self, db: DB, company_id: int, parent=None):
         super().__init__(parent)
         self.db = db
-        our_company = company_id
-        self.company_id = our_company
+        self.company_id = company_id
         self.setWindowTitle("Cadastro de Fornecedor / Cliente")
         self.table = QTableWidget(0, 13)
         self.table.setHorizontalHeaderLabels([
             "ID","Tipo","CNPJ/CPF","Razão/Nome","Contato1","Contato2","Rua","Bairro","Nº","CEP","UF","Cidade","Email"
         ])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        # Delegates/máscaras
+        self.table.setItemDelegateForColumn(2, DocNumberDelegate(self))
+        self.table.setItemDelegateForColumn(9, MaskDelegate(mask="00000-000", parent=self))
+        self.table.setItemDelegateForColumn(10, MaskDelegate(regex=r"[A-Za-z]{0,2}", uppercase=True, parent=self))
+
         btAdd = QPushButton("Novo")
+        btAdd.setIcon(std_icon(self, self.style().SP_FileDialogNewFolder))
         btSave = QPushButton("Salvar")
+        btSave.setIcon(std_icon(self, self.style().SP_DialogSaveButton))
         btDel = QPushButton("Excluir")
+        btDel.setIcon(std_icon(self, self.style().SP_TrashIcon))
         btReload = QPushButton("Recarregar")
+        btReload.setIcon(std_icon(self, self.style().SP_BrowserReload))
         btAdd.clicked.connect(self.add)
         btSave.clicked.connect(self.save)
         btDel.clicked.connect(self.delete)
@@ -1062,10 +1266,7 @@ class EntitiesDialog(QDialog):
         lay = QVBoxLayout(self)
         lay.addWidget(self.table)
         hl = QHBoxLayout()
-        hl.addWidget(btAdd)
-        hl.addWidget(btSave)
-        hl.addWidget(btDel)
-        hl.addWidget(btReload)
+        hl.addWidget(btAdd); hl.addWidget(btSave); hl.addWidget(btDel); hl.addWidget(btReload)
         lay.addLayout(hl)
         self.load()
 
@@ -1076,9 +1277,19 @@ class EntitiesDialog(QDialog):
             row = self.table.rowCount()
             self.table.insertRow(row)
             data = [
-                r["id"], r["kind"], r["cnpj_cpf"], r["razao_social"], r["contato1"], r["contato2"], r["rua"], r["bairro"],
-                r["numero"], r["cep"], r["uf"], r["cidade"], r["email"]
+                r["id"], r["kind"], (r["cnpj_cpf"] or ""), r["razao_social"], r["contato1"], r["contato2"], r["rua"], r["bairro"],
+                r["numero"], r["cep"], (r["uf"] or ""), r["cidade"], r["email"]
             ]
+            # formata doc se vier só com dígitos
+            d = only_digits(data[2])
+            if len(d) == 11:
+                data[2] = format_cpf(d)
+            elif len(d) == 14:
+                data[2] = format_cnpj(d)
+            if data[9]:
+                cepd = only_digits(data[9]); 
+                if len(cepd) == 8:
+                    data[9] = f"{cepd[:5]}-{cepd[5:]}"
             for c, val in enumerate(data):
                 item = QTableWidgetItem("" if val is None else str(val))
                 if c == 0:
@@ -1094,17 +1305,38 @@ class EntitiesDialog(QDialog):
     def save(self):
         for r in range(self.table.rowCount()):
             id_txt = self.table.item(r, 0).text() if self.table.item(r, 0) else ""
+            doc = self.table.item(r, 2).text() if self.table.item(r, 2) else ""
+            cep = self.table.item(r, 9).text() if self.table.item(r, 9) else ""
+            uf  = self.table.item(r, 10).text().upper() if self.table.item(r, 10) else ""
+            d = only_digits(doc)
+            if d:
+                if len(d) == 11 and not validate_cpf(d):
+                    msg_err(f"CPF inválido na linha {r+1}.")
+                    return
+                if len(d) == 14 and not validate_cnpj(d):
+                    msg_err(f"CNPJ inválido na linha {r+1}.")
+                    return
+                if len(d) not in (11,14):
+                    msg_err(f"Documento inválido (CPF/CNPJ) na linha {r+1}.")
+                    return
+            if cep and not validate_cep(cep):
+                msg_err(f"CEP inválido na linha {r+1}.")
+                return
+            if uf and not validate_uf(uf):
+                msg_err(f"UF inválida na linha {r+1}.")
+                return
+
             rec = dict(
                 kind=self.table.item(r, 1).text() if self.table.item(r, 1) else "FORNECEDOR",
-                cnpj_cpf=self.table.item(r, 2).text() if self.table.item(r, 2) else "",
+                cnpj_cpf=d,
                 razao_social=self.table.item(r, 3).text() if self.table.item(r, 3) else "",
                 contato1=self.table.item(r, 4).text() if self.table.item(r, 4) else "",
                 contato2=self.table.item(r, 5).text() if self.table.item(r, 5) else "",
                 rua=self.table.item(r, 6).text() if self.table.item(r, 6) else "",
                 bairro=self.table.item(r, 7).text() if self.table.item(r, 7) else "",
                 numero=self.table.item(r, 8).text() if self.table.item(r, 8) else "",
-                cep=self.table.item(r, 9).text() if self.table.item(r, 9) else "",
-                uf=self.table.item(r, 10).text() if self.table.item(r, 10) else "",
+                cep=only_digits(cep),
+                uf=uf,
                 cidade=self.table.item(r, 11).text() if self.table.item(r, 11) else "",
                 email=self.table.item(r, 12).text() if self.table.item(r, 12) else "",
                 active=1
@@ -1147,29 +1379,23 @@ class CategoriesDialog(QDialog):
         self.table = QTableWidget(0, 4)
         self.table.setHorizontalHeaderLabels(["ID Cat", "Categoria", "ID Sub", "Subcategoria"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        btAddCat = QPushButton("Nova Categoria")
-        btAddSub = QPushButton("Nova Subcategoria")
-        btSave = QPushButton("Salvar")
-        btDel = QPushButton("Excluir Selecionado")
-        btReload = QPushButton("Recarregar")
+        btAddCat = QPushButton("Nova Categoria"); btAddCat.setIcon(std_icon(self, self.style().SP_FileDialogNewFolder))
+        btAddSub = QPushButton("Nova Subcategoria"); btAddSub.setIcon(std_icon(self, self.style().SP_FileDialogNewFolder))
+        btSave = QPushButton("Salvar"); btSave.setIcon(std_icon(self, self.style().SP_DialogSaveButton))
+        btDel = QPushButton("Excluir Selecionado"); btDel.setIcon(std_icon(self, self.style().SP_TrashIcon))
+        btReload = QPushButton("Recarregar"); btReload.setIcon(std_icon(self, self.style().SP_BrowserReload))
         btAddCat.clicked.connect(self.add_cat)
         btAddSub.clicked.connect(self.add_sub)
         btSave.clicked.connect(self.save)
         btDel.clicked.connect(self.delete)
         btReload.clicked.connect(self.load)
         top = QHBoxLayout()
-        top.addWidget(QLabel("Tipo:"))
-        top.addWidget(self.cbTipo)
-        top.addStretch()
+        top.addWidget(QLabel("Tipo:")); top.addWidget(self.cbTipo); top.addStretch()
         lay = QVBoxLayout(self)
-        lay.addLayout(top)
-        lay.addWidget(self.table)
+        lay.addLayout(top); lay.addWidget(self.table)
         hl = QHBoxLayout()
-        hl.addWidget(btAddCat)
-        hl.addWidget(btAddSub)
-        hl.addWidget(btSave)
-        hl.addWidget(btDel)
-        hl.addWidget(btReload)
+        for b in (btAddCat, btAddSub, btSave, btDel, btReload):
+            hl.addWidget(b)
         lay.addLayout(hl)
         self.load()
 
@@ -1277,8 +1503,7 @@ class PaymentDialog(QDialog):
         self.user_id = user_id
         self.setWindowTitle("Liquidar Lançamento")
         form = QFormLayout(self)
-        self.dt = QDateEdit(QDate.currentDate())
-        self.dt.setCalendarPopup(True)
+        self.dt = QDateEdit(QDate.currentDate()); self.dt.setCalendarPopup(True)
         self.cbBank = QComboBox()
         self.banks = self.db.banks(company_id)
         for b in self.banks:
@@ -1294,7 +1519,7 @@ class PaymentDialog(QDialog):
         form.addRow("Juros:", self.edJuros)
         form.addRow("Desconto:", self.edDesc)
         form.addRow("Documento ref.:", self.edDoc)
-        bt = QPushButton("Confirmar")
+        bt = QPushButton("Confirmar"); bt.setIcon(std_icon(self, self.style().SP_DialogApplyButton))
         bt.clicked.connect(self.ok)
         form.addRow(bt)
         self.ok_clicked = False
@@ -1332,25 +1557,18 @@ class TransactionsDialog(QDialog):
         self.rbPagar.toggled.connect(self.load)
 
         top = QHBoxLayout()
-        top.addWidget(self.rbPagar)
-        top.addWidget(self.rbReceber)
-        top.addStretch()
+        top.addWidget(self.rbPagar); top.addWidget(self.rbReceber); top.addStretch()
 
         self.cbEnt = QComboBox()
         self.cbCat = QComboBox()
         self.cbSub = QComboBox()
-        self.cbForma = QComboBox()
-        self.cbForma.addItems(["Boleto", "PIX", "Transferência", "Dinheiro"])
+        self.cbForma = QComboBox(); self.cbForma.addItems(["Boleto", "PIX", "Transferência", "Dinheiro"])
         self.cbBanco = QComboBox()
-        self.dtLanc = QDateEdit(QDate.currentDate())
-        self.dtLanc.setCalendarPopup(True)
-        self.dtVenc = QDateEdit(QDate.currentDate())
-        self.dtVenc.setCalendarPopup(True)
+        self.dtLanc = QDateEdit(QDate.currentDate()); self.dtLanc.setCalendarPopup(True)
+        self.dtVenc = QDateEdit(QDate.currentDate()); self.dtVenc.setCalendarPopup(True)
         self.edDesc = QLineEdit()
         self.edValor = QLineEdit()
-        self.spParcelas = QSpinBox()
-        self.spParcelas.setRange(1, 120)
-        self.spParcelas.setValue(1)
+        self.spParcelas = QSpinBox(); self.spParcelas.setRange(1, 120); self.spParcelas.setValue(1)
 
         form = QFormLayout()
         form.addRow("Fornecedor/Cliente:", self.cbEnt)
@@ -1370,36 +1588,33 @@ class TransactionsDialog(QDialog):
         ])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
 
-        btNovo = QPushButton("Novo")
-        btSalvar = QPushButton("Salvar")
-        btExcluir = QPushButton("Excluir")
-        btLiquidar = QPushButton("Liquidar")
-        btEstornar = QPushButton("Estornar baixa")
+        btNovo = QPushButton("Novo"); btNovo.setIcon(std_icon(self, self.style().SP_FileDialogNewFolder))
+        btSalvar = QPushButton("Salvar"); btSalvar.setIcon(std_icon(self, self.style().SP_DialogSaveButton))
+        btExcluir = QPushButton("Excluir"); btExcluir.setIcon(std_icon(self, self.style().SP_TrashIcon))
+        btLiquidar = QPushButton("Liquidar"); btLiquidar.setIcon(std_icon(self, self.style().SP_DialogApplyButton))
+        btEstornar = QPushButton("Estornar baixa"); btEstornar.setIcon(std_icon(self, self.style().SP_ArrowBack))
+        btExpPdf = QPushButton("PDF da lista"); btExpPdf.setIcon(std_icon(self, self.style().SP_DriveDVDIcon))
+        btExpXls = QPushButton("Excel da lista"); btExpXls.setIcon(std_icon(self, self.style().SP_DialogSaveButton))
         btNovo.clicked.connect(self.new)
         btSalvar.clicked.connect(self.save)
         btExcluir.clicked.connect(self.delete)
         btLiquidar.clicked.connect(self.liquidar)
         btEstornar.clicked.connect(self.estornar)
+        btExpPdf.clicked.connect(lambda: export_pdf_from_table(self, self.table, "Lancamentos"))
+        btExpXls.clicked.connect(lambda: export_excel_from_table(self, self.table, "Lancamentos"))
 
         lay = QVBoxLayout(self)
-        lay.addLayout(top)
-        lay.addLayout(form)
-        lay.addWidget(self.table)
+        lay.addLayout(top); lay.addLayout(form); lay.addWidget(self.table)
         hl = QHBoxLayout()
-        hl.addWidget(btNovo)
-        hl.addWidget(btSalvar)
-        hl.addWidget(btExcluir)
-        hl.addWidget(btLiquidar)
-        hl.addWidget(btEstornar)
+        for b in (btNovo, btSalvar, btExcluir, btLiquidar, btEstornar, btExpPdf, btExpXls):
+            hl.addWidget(b)
         lay.addLayout(hl)
 
         self.populate_static()
         self.load()
 
     def tipo(self):
-        if self.rbPagar.isChecked():
-            return "PAGAR"
-        return "RECEBER"
+        return "PAGAR" if self.rbPagar.isChecked() else "RECEBER"
 
     def populate_static(self):
         self.cbBanco.clear()
@@ -1450,8 +1665,7 @@ class TransactionsDialog(QDialog):
                 self.table.setItem(row, c, it)
 
     def new(self):
-        self.edDesc.clear()
-        self.edValor.clear()
+        self.edDesc.clear(); self.edValor.clear()
         self.spParcelas.setValue(1)
         self.dtLanc.setDate(QDate.currentDate())
         self.dtVenc.setDate(QDate.currentDate())
@@ -1543,27 +1757,26 @@ class CashflowDialog(QDialog):
         self.db = db
         self.company_id = company_id
         self.setWindowTitle("Fluxo de Caixa")
-        self.dtIni = QDateEdit(QDate.currentDate().addMonths(-1))
-        self.dtIni.setCalendarPopup(True)
-        self.dtFim = QDateEdit(QDate.currentDate())
-        self.dtFim.setCalendarPopup(True)
+        self.dtIni = QDateEdit(QDate.currentDate().addMonths(-1)); self.dtIni.setCalendarPopup(True)
+        self.dtFim = QDateEdit(QDate.currentDate()); self.dtFim.setCalendarPopup(True)
         self.table = QTableWidget(0, 3)
         self.table.setHorizontalHeaderLabels(["Data", "Conta", "Valor (efeito)"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.lbTotal = QLabel("Total: 0,00")
-        bt = QPushButton("Atualizar")
+        bt = QPushButton("Atualizar"); bt.setIcon(std_icon(self, self.style().SP_BrowserReload))
         bt.clicked.connect(self.load)
+        btPdf = QPushButton("Exportar PDF"); btPdf.setIcon(std_icon(self, self.style().SP_DriveDVDIcon))
+        btCsv = QPushButton("Exportar Excel/CSV"); btCsv.setIcon(std_icon(self, self.style().SP_DialogSaveButton))
+        btPdf.clicked.connect(lambda: export_pdf_from_table(self, self.table, "Fluxo_de_Caixa"))
+        btCsv.clicked.connect(lambda: export_excel_from_table(self, self.table, "Fluxo_de_Caixa"))
         form = QHBoxLayout()
-        form.addWidget(QLabel("Início:"))
-        form.addWidget(self.dtIni)
-        form.addWidget(QLabel("Fim:"))
-        form.addWidget(self.dtFim)
-        form.addWidget(bt)
-        form.addStretch()
+        form.addWidget(QLabel("Início:")); form.addWidget(self.dtIni)
+        form.addWidget(QLabel("Fim:")); form.addWidget(self.dtFim)
+        form.addWidget(bt); form.addStretch()
         lay = QVBoxLayout(self)
-        lay.addLayout(form)
-        lay.addWidget(self.table)
-        lay.addWidget(self.lbTotal)
+        lay.addLayout(form); lay.addWidget(self.table); lay.addWidget(self.lbTotal)
+        hl = QHBoxLayout(); hl.addWidget(btPdf); hl.addWidget(btCsv); hl.addStretch()
+        lay.addLayout(hl)
         self.load()
 
     def load(self):
@@ -1591,40 +1804,34 @@ class DREDialog(QDialog):
         self.db = db
         self.company_id = company_id
         self.setWindowTitle("Demonstração de Resultado (DRE)")
-        self.spAno = QSpinBox()
-        self.spAno.setRange(2000, 2099)
-        self.spAno.setValue(date.today().year)
-        self.spMes = QSpinBox()
-        self.spMes.setRange(0, 12)
-        self.spMes.setValue(0)
-        self.cbReg = QComboBox()
-        self.cbReg.addItems(["COMPETENCIA", "CAIXA"])
-        bt = QPushButton("Gerar")
+        self.spAno = QSpinBox(); self.spAno.setRange(2000, 2099); self.spAno.setValue(date.today().year)
+        self.spMes = QSpinBox(); self.spMes.setRange(0, 12); self.spMes.setValue(0)
+        self.cbReg = QComboBox(); self.cbReg.addItems(["COMPETENCIA", "CAIXA"])
+        bt = QPushButton("Gerar"); bt.setIcon(std_icon(self, self.style().SP_BrowserReload))
         bt.clicked.connect(self.load)
+        btPdf = QPushButton("Exportar PDF"); btPdf.setIcon(std_icon(self, self.style().SP_DriveDVDIcon))
+        btCsv = QPushButton("Exportar Excel/CSV"); btCsv.setIcon(std_icon(self, self.style().SP_DialogSaveButton))
+        btPdf.clicked.connect(lambda: export_pdf_from_table(self, self.table, "DRE"))
+        btCsv.clicked.connect(lambda: export_excel_from_table(self, self.table, "DRE"))
         top = QHBoxLayout()
-        top.addWidget(QLabel("Ano:"))
-        top.addWidget(self.spAno)
-        top.addWidget(QLabel("Mês (0=todos):"))
-        top.addWidget(self.spMes)
-        top.addWidget(QLabel("Regime:"))
-        top.addWidget(self.cbReg)
-        top.addWidget(bt)
-        top.addStretch()
+        top.addWidget(QLabel("Ano:")); top.addWidget(self.spAno)
+        top.addWidget(QLabel("Mês (0=todos):")); top.addWidget(self.spMes)
+        top.addWidget(QLabel("Regime:")); top.addWidget(self.cbReg)
+        top.addWidget(bt); top.addStretch()
         self.table = QTableWidget(0, 3)
         self.table.setHorizontalHeaderLabels(["Categoria", "Tipo", "Valor"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.lbResumo = QLabel("")
         lay = QVBoxLayout(self)
-        lay.addLayout(top)
-        lay.addWidget(self.table)
-        lay.addWidget(self.lbResumo)
+        lay.addLayout(top); lay.addWidget(self.table); lay.addWidget(self.lbResumo)
+        hl = QHBoxLayout(); hl.addWidget(btPdf); hl.addWidget(btCsv); hl.addStretch()
+        lay.addLayout(hl)
 
     def load(self):
         mes = self.spMes.value() or None
         rows = self.db.dre(self.company_id, self.spAno.value(), mes, self.cbReg.currentText())
         self.table.setRowCount(0)
-        rec = 0.0
-        desp = 0.0
+        rec = 0.0; desp = 0.0
         for r in rows:
             row = self.table.rowCount()
             self.table.insertRow(row)
@@ -1647,27 +1854,18 @@ class PeriodDialog(QDialog):
         self.company_id = company_id
         self.user_id = user_id
         self.setWindowTitle("Fechamento de Mês")
-        self.spAno = QSpinBox()
-        self.spAno.setRange(2000, 2099)
-        self.spAno.setValue(date.today().year)
-        self.spMes = QSpinBox()
-        self.spMes.setRange(1, 12)
-        self.spMes.setValue(date.today().month)
+        self.spAno = QSpinBox(); self.spAno.setRange(2000, 2099); self.spAno.setValue(date.today().year)
+        self.spMes = QSpinBox(); self.spMes.setRange(1, 12); self.spMes.setValue(date.today().month)
         self.lbStatus = QLabel("Status: -")
-        btStatus = QPushButton("Ver status")
+        btStatus = QPushButton("Ver status"); btStatus.setIcon(std_icon(self, self.style().SP_MessageBoxInformation))
         btStatus.clicked.connect(self.check)
-        btFechar = QPushButton("Fechar mês")
+        btFechar = QPushButton("Fechar mês"); btFechar.setIcon(std_icon(self, self.style().SP_DialogApplyButton))
         btFechar.clicked.connect(lambda: self.set_status('CLOSED'))
-        btReabrir = QPushButton("Reabrir mês")
+        btReabrir = QPushButton("Reabrir mês"); btReabrir.setIcon(std_icon(self, self.style().SP_DialogResetButton))
         btReabrir.clicked.connect(lambda: self.set_status('OPEN'))
         form = QFormLayout(self)
-        form.addRow("Ano:", self.spAno)
-        form.addRow("Mês:", self.spMes)
-        form.addRow(self.lbStatus)
-        hl = QHBoxLayout()
-        hl.addWidget(btStatus)
-        hl.addWidget(btFechar)
-        hl.addWidget(btReabrir)
+        form.addRow("Ano:", self.spAno); form.addRow("Mês:", self.spMes); form.addRow(self.lbStatus)
+        hl = QHBoxLayout(); hl.addWidget(btStatus); hl.addWidget(btFechar); hl.addWidget(btReabrir)
         form.addRow(hl)
         self.check()
 
@@ -1681,7 +1879,7 @@ class PeriodDialog(QDialog):
         self.check()
 
 # -----------------------------------------------------------------------------
-# Login
+# Login & Janela principal
 # -----------------------------------------------------------------------------
 class LoginWindow(QWidget):
     def __init__(self, db: DB):
@@ -1694,13 +1892,12 @@ class LoginWindow(QWidget):
             self.cbEmp.addItem(c["razao_social"], c["id"])
         self.cbUser = QComboBox()
         self.cbEmp.currentIndexChanged.connect(self.reload_users)
-        self.edPass = QLineEdit()
-        self.edPass.setEchoMode(QLineEdit.Password)
-        self.btEntrar = QPushButton("Entrar")
+        self.edPass = QLineEdit(); self.edPass.setEchoMode(QLineEdit.Password)
+        self.btEntrar = QPushButton("Entrar"); self.btEntrar.setIcon(std_icon(self, self.style().SP_DialogOkButton))
         self.btEntrar.clicked.connect(self.login)
 
-        self.btEmp = QPushButton("Cadastro de empresa")
-        self.btUser = QPushButton("Cadastro de usuário")
+        self.btEmp = QPushButton("Cadastro de empresa"); self.btEmp.setIcon(std_icon(self, self.style().SP_ComputerIcon))
+        self.btUser = QPushButton("Cadastro de usuário"); self.btUser.setIcon(std_icon(self, self.style().SP_DirHomeIcon))
         self.btEmp.clicked.connect(self.open_emp_admin)
         self.btUser.clicked.connect(self.open_user_admin)
 
@@ -1709,13 +1906,9 @@ class LoginWindow(QWidget):
         form.addRow("Usuário:", self.cbUser)
         form.addRow("Senha:", self.edPass)
         hl = QHBoxLayout()
-        hl.addWidget(self.btEmp)
-        hl.addWidget(self.btUser)
-        hl.addStretch()
+        hl.addWidget(self.btEmp); hl.addWidget(self.btUser); hl.addStretch()
         lay = QVBoxLayout(self)
-        lay.addLayout(form)
-        lay.addWidget(self.btEntrar)
-        lay.addLayout(hl)
+        lay.addLayout(form); lay.addWidget(self.btEntrar); lay.addLayout(hl)
         self.reload_users()
 
     def reload_users(self):
@@ -1727,8 +1920,7 @@ class LoginWindow(QWidget):
     def open_emp_admin(self):
         auth = AdminAuthDialog(self.db, self)
         if auth.exec_() and auth.ok:
-            dlg = CompaniesDialog(self.db, self)
-            dlg.exec_()
+            dlg = CompaniesDialog(self.db, self); dlg.exec_()
             self.cbEmp.clear()
             for c in self.db.list_companies():
                 self.cbEmp.addItem(c["razao_social"], c["id"])
@@ -1737,8 +1929,7 @@ class LoginWindow(QWidget):
     def open_user_admin(self):
         auth = AdminAuthDialog(self.db, self)
         if auth.exec_() and auth.ok:
-            dlg = UsersDialog(self.db, self)
-            dlg.exec_()
+            dlg = UsersDialog(self.db, self); dlg.exec_()
             self.reload_users()
 
     def login(self):
@@ -1760,46 +1951,41 @@ class MainWindow(QMainWindow):
         self.user = user_row
         comp = self.db.q("SELECT razao_social FROM companies WHERE id=?", (company_id,))[0]["razao_social"]
         self.setWindowTitle(f"{APP_TITLE} - {comp}")
-        _ = self.db.user_permissions(self.user["id"])
+        perms = self.db.user_permissions(self.user["id"])
 
         menubar = self.menuBar()
         mCad = menubar.addMenu("Cadastros")
-        actBanks = QAction("Bancos", self)
+        actBanks = QAction(QIcon(), "Bancos", self); actBanks.setIcon(std_icon(self, self.style().SP_DriveHDIcon))
         actBanks.triggered.connect(self.open_banks)
-        actEnts = QAction("Fornecedores/Clientes", self)
+        actEnts = QAction(QIcon(), "Fornecedores/Clientes", self); actEnts.setIcon(std_icon(self, self.style().SP_DirIcon))
         actEnts.triggered.connect(self.open_entities)
-        actCats = QAction("Categorias/Subcategorias", self)
+        actCats = QAction(QIcon(), "Categorias/Subcategorias", self); actCats.setIcon(std_icon(self, self.style().SP_FileIcon))
         actCats.triggered.connect(self.open_categories)
-        mCad.addAction(actBanks)
-        mCad.addAction(actEnts)
-        mCad.addAction(actCats)
+        mCad.addAction(actBanks); mCad.addAction(actEnts); mCad.addAction(actCats)
         if self.db.is_admin(self.user["id"]):
-            actEmp = QAction("Empresas (admin)", self)
-            actEmp.triggered.connect(self.open_companies)
-            mCad.addAction(actEmp)
-            actUsers = QAction("Usuários (admin)", self)
-            actUsers.triggered.connect(self.open_users)
-            mCad.addAction(actUsers)
+            actEmp = QAction("Empresas (admin)", self); actEmp.setIcon(std_icon(self, self.style().SP_ComputerIcon))
+            actEmp.triggered.connect(self.open_companies); mCad.addAction(actEmp)
+            actUsers = QAction("Usuários (admin)", self); actUsers.setIcon(std_icon(self, self.style().SP_DirHomeIcon))
+            actUsers.triggered.connect(self.open_users); mCad.addAction(actUsers)
 
         mMov = menubar.addMenu("Movimentação")
-        actTx = QAction("Lançamentos (Pagar/Receber)", self)
+        actTx = QAction("Lançamentos (Pagar/Receber)", self); actTx.setIcon(std_icon(self, self.style().SP_DialogYesButton))
         actTx.triggered.connect(self.open_transactions)
         mMov.addAction(actTx)
 
         mRel = menubar.addMenu("Relatórios")
-        actFluxo = QAction("Fluxo de Caixa", self)
+        actFluxo = QAction("Fluxo de Caixa", self); actFluxo.setIcon(std_icon(self, self.style().SP_FileDialogDetailedView))
         actFluxo.triggered.connect(self.open_cashflow)
-        actDre = QAction("DRE", self)
+        actDre = QAction("DRE", self); actDre.setIcon(std_icon(self, self.style().SP_FileDialogListView))
         actDre.triggered.connect(self.open_dre)
-        mRel.addAction(actFluxo)
-        mRel.addAction(actDre)
+        mRel.addAction(actFluxo); mRel.addAction(actDre)
 
         mPer = menubar.addMenu("Período")
-        actPer = QAction("Fechar / Reabrir Mês", self)
+        actPer = QAction("Fechar / Reabrir Mês", self); actPer.setIcon(std_icon(self, self.style().SP_DialogResetButton))
         actPer.triggered.connect(self.open_period)
         mPer.addAction(actPer)
 
-        actSair = QAction("Sair", self)
+        actSair = QAction("Sair", self); actSair.setIcon(std_icon(self, self.style().SP_DialogCloseButton))
         actSair.triggered.connect(self.close)
         menubar.addAction(actSair)
 
