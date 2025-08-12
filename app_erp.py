@@ -16,7 +16,7 @@ try:
 except Exception:
     from secrets import compare_digest as secure_eq
 
-from PyQt5.QtCore import Qt, QDate, QRegExp, QPoint, QSizeF  # <- adicionado QSizeF
+from PyQt5.QtCore import Qt, QDate, QRegExp, QPoint, QSizeF, pyqtSignal
 from PyQt5.QtGui import QRegExpValidator, QTextDocument
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QLabel, QComboBox, QLineEdit, QPushButton, QHBoxLayout,
@@ -716,74 +716,136 @@ class CompaniesDialog(QDialog):
     def __init__(self, db: DB, parent=None):
         super().__init__(parent); self.db=db
         self.setWindowTitle("Cadastro de Empresas")
+
         self.table=QTableWidget(0,14)
-        self.table.setHorizontalHeaderLabels(["ID","CNPJ","Razão Social","Contato 1","Contato 2",
-                                              "Rua","Bairro","Nº","CEP","UF","Cidade","Email","Ativo","Criado em"])
+        self.table.setHorizontalHeaderLabels([
+            "ID","CNPJ","Razão Social","Contato 1","Contato 2",
+            "Rua","Bairro","Nº","CEP","UF","Cidade","Email","Ativo","Criado em"
+        ])
         stretch_table(self.table); zebra_table(self.table)
+
+        # Oculta ID
         self.table.setColumnHidden(0, True)
-        self.table.setItemDelegateForColumn(1, DocNumberDelegate(self))
-        self.table.setItemDelegateForColumn(8, MaskDelegate(mask="00000-000", parent=self))
+
+        # Máscaras/validações de edição
+        # CNPJ com máscara (não vamos validar DV mais)
+        self.table.setItemDelegateForColumn(1, MaskDelegate(mask="00.000.000/0000-00;_", parent=self))
+        # CEP e UF com validação
+        self.table.setItemDelegateForColumn(8, MaskDelegate(mask="00000-000;_", parent=self))
         self.table.setItemDelegateForColumn(9, MaskDelegate(regex=r"[A-Za-z]{0,2}", uppercase=True, parent=self))
+
+        # Botões
         btAdd=QPushButton("Novo"); btSave=QPushButton("Salvar"); btDel=QPushButton("Excluir"); btReload=QPushButton("Recarregar")
-        for b,ic in ((btAdd,self.style().SP_FileDialogNewFolder),(btSave,self.style().SP_DialogSaveButton),
-                     (btDel,self.style().SP_TrashIcon),(btReload,self.style().SP_BrowserReload)):
+        for b,ic in ((btAdd,self.style().SP_FileDialogNewFolder),
+                     (btSave,self.style().SP_DialogSaveButton),
+                     (btDel,self.style().SP_TrashIcon),
+                     (btReload,self.style().SP_BrowserReload)):
             b.setIcon(std_icon(self, ic))
-        btAdd.clicked.connect(self.add); btSave.clicked.connect(self.save); btDel.clicked.connect(self.delete); btReload.clicked.connect(self.load)
-        lay=QVBoxLayout(self); lay.addWidget(self.table); hl=QHBoxLayout(); [hl.addWidget(b) for b in (btAdd,btSave,btDel,btReload)]; lay.addLayout(hl)
-        self.load(); enable_autosize(self, 0.85, 0.75, 1100, 650)
+        btAdd.clicked.connect(self.add)
+        btSave.clicked.connect(self.save)
+        btDel.clicked.connect(self.delete)
+        btReload.clicked.connect(self.load)
+
+        lay=QVBoxLayout(self)
+        lay.addWidget(self.table)
+        hl=QHBoxLayout(); [hl.addWidget(b) for b in (btAdd,btSave,btDel,btReload)]
+        lay.addLayout(hl)
+
+        self.load()
+        enable_autosize(self, 0.85, 0.75, 1100, 650)
+
     def load(self):
-        rows = self.db.companies_all(); self.table.setRowCount(0)
+        rows = self.db.companies_all()
+        self.table.setRowCount(0)
         for r in rows:
             row=self.table.rowCount(); self.table.insertRow(row)
+
             cnpj = format_cnpj(r["cnpj"] or "")
-            cep = r["cep"] or ""
+            cep  = r["cep"] or ""
             if cep:
-                dcep=only_digits(cep); cep=f"{dcep[:5]}-{dcep[5:]}" if len(dcep)==8 else cep
-            data=[r["id"], cnpj, r["razao_social"], r["contato1"], r["contato2"], r["rua"], r["bairro"],
-                  r["numero"], cep, (r["uf"] or ""), r["cidade"], r["email"], r["active"], iso_to_br(str(r["created_at"])[:10])]
+                dcep = only_digits(cep)
+                cep  = f"{dcep[:5]}-{dcep[5:]}" if len(dcep)==8 else cep
+
+            data=[r["id"], cnpj, r["razao_social"], r["contato1"], r["contato2"],
+                  r["rua"], r["bairro"], r["numero"], cep, (r["uf"] or ""),
+                  r["cidade"], r["email"], r["active"], iso_to_br(str(r["created_at"])[:10])]
+
             for c,val in enumerate(data):
                 it=QTableWidgetItem("" if val is None else str(val))
-                if c in (0,13): it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+                if c in (0,13):  # ID e "Criado em" não editáveis
+                    it.setFlags(it.flags() & ~Qt.ItemIsEditable)
                 self.table.setItem(row,c,it)
+
     def add(self):
-        r=self.table.rowCount(); self.table.insertRow(r); self.table.setItem(r,0,QTableWidgetItem(""))
-        self.table.setItem(r,12,QTableWidgetItem("1"))
+        r=self.table.rowCount(); self.table.insertRow(r)
+        self.table.setItem(r,0,QTableWidgetItem(""))
+        self.table.setItem(r,12,QTableWidgetItem("1"))  # Ativo=1
+
     def save(self):
         for r in range(self.table.rowCount()):
-            id_txt=self.table.item(r,0).text() if self.table.item(r,0) else ""
-            cnpj = only_digits(self.table.item(r,1).text() if self.table.item(r,1) else "")
-            if cnpj and not validate_cnpj(cnpj): msg_err(f"CNPJ inválido (linha {r+1})."); return
-            cep=self.table.item(r,8).text() if self.table.item(r,8) else ""
-            if cep and not validate_cep(cep): msg_err(f"CEP inválido (linha {r+1})."); return
-            uf=self.table.item(r,9).text().upper() if self.table.item(r,9) else ""
-            if uf and not validate_uf(uf): msg_err(f"UF inválida (linha {r+1})."); return
-            rec=dict(
-                cnpj=cnpj, razao_social=self.table.item(r,2).text() if self.table.item(r,2) else "",
+            id_txt = self.table.item(r,0).text() if self.table.item(r,0) else ""
+
+            # --- CNPJ: aceitar qualquer CNPJ com 14 dígitos (sem checar DV) ---
+            cnpj_masked = self.table.item(r,1).text() if self.table.item(r,1) else ""
+            cnpj = only_digits(cnpj_masked)
+            if cnpj and len(cnpj) != 14:
+                msg_err(f"CNPJ deve ter 14 dígitos (linha {r+1}).")
+                return
+
+            # CEP e UF continuam com validação básica
+            cep = self.table.item(r,8).text() if self.table.item(r,8) else ""
+            if cep and not validate_cep(cep):
+                msg_err(f"CEP inválido (linha {r+1}).")
+                return
+            uf = self.table.item(r,9).text().upper() if self.table.item(r,9) else ""
+            if uf and not validate_uf(uf):
+                msg_err(f"UF inválida (linha {r+1}).")
+                return
+
+            rec = dict(
+                cnpj=cnpj,
+                razao_social=self.table.item(r,2).text() if self.table.item(r,2) else "",
                 contato1=self.table.item(r,3).text() if self.table.item(r,3) else "",
                 contato2=self.table.item(r,4).text() if self.table.item(r,4) else "",
                 rua=self.table.item(r,5).text() if self.table.item(r,5) else "",
                 bairro=self.table.item(r,6).text() if self.table.item(r,6) else "",
                 numero=self.table.item(r,7).text() if self.table.item(r,7) else "",
-                cep=only_digits(cep), uf=uf,
+                cep=only_digits(cep),
+                uf=uf,
                 cidade=self.table.item(r,10).text() if self.table.item(r,10) else "",
                 email=self.table.item(r,11).text() if self.table.item(r,11) else "",
                 active=1 if (self.table.item(r,12) and self.table.item(r,12).text() not in ("0","False","false")) else 0
             )
-            if not rec["razao_social"]: msg_err("Razão Social é obrigatória."); return
-            cid=int(id_txt) if id_txt.strip().isdigit() else None
-            cid=self.db.company_save(rec, cid); self.table.setItem(r,0,QTableWidgetItem(str(cid)))
-        msg_info("Empresas salvas."); self.load()
+            if not rec["razao_social"]:
+                msg_err("Razão Social é obrigatória.")
+                return
+
+            cid = int(id_txt) if id_txt.strip().isdigit() else None
+            cid = self.db.company_save(rec, cid)
+            self.table.setItem(r,0,QTableWidgetItem(str(cid)))
+
+        msg_info("Empresas salvas.")
+        self.load()
+
     def delete(self):
         r=self.table.currentRow()
-        if r<0: return
-        id_txt=self.table.item(r,0).text() if self.table.item(r,0) else ""
-        if not id_txt.strip().isdigit(): self.table.removeRow(r); return
+        if r < 0:
+            return
+        id_txt = self.table.item(r,0).text() if self.table.item(r,0) else ""
+        if not id_txt.strip().isdigit():
+            self.table.removeRow(r); return
+
         # exige admin
-        auth=AdminAuthDialog(self.db, self)
-        if not (auth.exec_() and auth.ok): return
-        if not msg_yesno("Excluir esta empresa?"): return
-        try: self.db.company_delete(int(id_txt))
-        except sqlite3.IntegrityError as e: msg_err(f"Não foi possível excluir. Existem dados vinculados.\n{e}"); return
+        auth = AdminAuthDialog(self.db, self)
+        if not (auth.exec_() and auth.ok):
+            return
+        if not msg_yesno("Excluir esta empresa?"):
+            return
+        try:
+            self.db.company_delete(int(id_txt))
+        except sqlite3.IntegrityError as e:
+            msg_err(f"Não foi possível excluir. Existem dados vinculados.\n{e}")
+            return
         self.load()
 
 class UsersDialog(QDialog):
@@ -1039,114 +1101,268 @@ class EntitiesDialog(QDialog):
 
 class CategoriesDialog(QDialog):
     def __init__(self, db: DB, company_id: int, parent=None):
-        super().__init__(parent); self.db=db; self.company_id=company_id
+        super().__init__(parent)
+        self.db = db
+        self.company_id = company_id
         self.setWindowTitle("Cadastro de Categorias e Subcategorias")
+
         # filtro tipo
-        self.cbTipo=QComboBox(); self.cbTipo.addItems(["PAGAR","RECEBER"]); self.cbTipo.currentIndexChanged.connect(self.load)
-        top=QHBoxLayout(); top.addWidget(QLabel("Tipo:")); top.addWidget(self.cbTipo); top.addStretch()
+        self.cbTipo = QComboBox()
+        self.cbTipo.addItems(["PAGAR", "RECEBER"])
+        self.cbTipo.currentIndexChanged.connect(self.load)
+
+        top = QHBoxLayout()
+        top.addWidget(QLabel("Tipo:"))
+        top.addWidget(self.cbTipo)
+        top.addStretch()
 
         # tabela categorias
-        self.tblCat=QTableWidget(0,3)
-        self.tblCat.setHorizontalHeaderLabels(["ID","Categoria","Tipo"])
-        stretch_table(self.tblCat); zebra_table(self.tblCat); self.tblCat.setColumnHidden(0, True)
+        self.tblCat = QTableWidget(0, 3)
+        self.tblCat.setHorizontalHeaderLabels(["ID", "Categoria", "Tipo"])
+        stretch_table(self.tblCat)
+        zebra_table(self.tblCat)
+        self.tblCat.setColumnHidden(0, True)
         self.tblCat.currentCellChanged.connect(self.load_subs)
 
         # tabela subcategorias
-        self.tblSub=QTableWidget(0,2)
-        self.tblSub.setHorizontalHeaderLabels(["ID","Subcategoria"])
-        stretch_table(self.tblSub); zebra_table(self.tblSub); self.tblSub.setColumnHidden(0, True)
+        self.tblSub = QTableWidget(0, 2)
+        self.tblSub.setHorizontalHeaderLabels(["ID", "Subcategoria"])
+        stretch_table(self.tblSub)
+        zebra_table(self.tblSub)
+        self.tblSub.setColumnHidden(0, True)
 
         # botões
-        btAddC=QPushButton("Nova Categoria"); btSaveC=QPushButton("Salvar Cat."); btDelC=QPushButton("Excluir Cat.")
-        btAddS=QPushButton("Nova Subcat."); btSaveS=QPushButton("Salvar Sub."); btDelS=QPushButton("Excluir Sub.")
-        for b,ic in ((btAddC,self.style().SP_FileDialogNewFolder),(btSaveC,self.style().SP_DialogSaveButton),
-                     (btDelC,self.style().SP_TrashIcon),(btAddS,self.style().SP_FileDialogNewFolder),
-                     (btSaveS,self.style().SP_DialogSaveButton),(btDelS,self.style().SP_TrashIcon)):
+        btAddC = QPushButton("Nova Categoria")
+        btSaveC = QPushButton("Salvar Cat.")
+        btDelC = QPushButton("Excluir Cat.")
+
+        btAddS = QPushButton("Nova Subcat.")
+        btSaveS = QPushButton("Salvar Sub.")
+        btDelS = QPushButton("Excluir Sub.")
+
+        for b, ic in (
+            (btAddC, self.style().SP_FileDialogNewFolder),
+            (btSaveC, self.style().SP_DialogSaveButton),
+            (btDelC, self.style().SP_TrashIcon),
+            (btAddS, self.style().SP_FileDialogNewFolder),
+            (btSaveS, self.style().SP_DialogSaveButton),
+            (btDelS, self.style().SP_TrashIcon),
+        ):
             b.setIcon(std_icon(self, ic))
-        btAddC.clicked.connect(self.add_cat); btSaveC.clicked.connect(self.save_cat); btDelC.clicked.connect(self.del_cat)
-        btAddS.clicked.connect(self.add_sub); btSaveS.clicked.connect(self.save_sub); btDelS.clicked.connect(self.del_sub)
 
-        left=QVBoxLayout(); left.addLayout(top); left.addWidget(self.tblCat)
-        lc=QHBoxLayout(); [lc.addWidget(b) for b in (btAddC,btSaveC,btDelC)]; left.addLayout(lc)
-        right=QVBoxLayout(); right.addWidget(self.tblSub)
-        rs=QHBoxLayout(); [rs.addWidget(b) for b in (btAddS,btSaveS,btDelS)]; right.addLayout(rs)
-        main=QHBoxLayout(self); main.addLayout(left,3); main.addLayout(right,2)
+        btAddC.clicked.connect(self.add_cat)
+        btSaveC.clicked.connect(self.save_cat_and_subs)   # salva cat + subs
+        btDelC.clicked.connect(self.del_cat)
 
-        self.load(); enable_autosize(self, 0.85, 0.75, 1100, 650)
+        btAddS.clicked.connect(self.add_sub)
+        btSaveS.clicked.connect(self.save_sub)            # salva subs (e salva cat se precisar)
+        btDelS.clicked.connect(self.del_sub)
 
+        left = QVBoxLayout()
+        left.addLayout(top)
+        left.addWidget(self.tblCat)
+        lc = QHBoxLayout()
+        [lc.addWidget(b) for b in (btAddC, btSaveC, btDelC)]
+        left.addLayout(lc)
+
+        right = QVBoxLayout()
+        right.addWidget(self.tblSub)
+        rs = QHBoxLayout()
+        [rs.addWidget(b) for b in (btAddS, btSaveS, btDelS)]
+        right.addLayout(rs)
+
+        main = QHBoxLayout(self)
+        main.addLayout(left, 3)
+        main.addLayout(right, 2)
+
+        self.load()
+        enable_autosize(self, 0.85, 0.75, 1100, 650)
+
+    # ----------------- carregamento -----------------
     def load(self):
-        tipo=self.cbTipo.currentText()
-        rows=self.db.categories(self.company_id, tipo); self.tblCat.setRowCount(0); self.tblSub.setRowCount(0)
+        tipo = self.cbTipo.currentText()
+        rows = self.db.categories(self.company_id, tipo)
+        self.tblCat.setRowCount(0)
+        self.tblSub.setRowCount(0)
         for r in rows:
-            row=self.tblCat.rowCount(); self.tblCat.insertRow(row)
-            for c,val in enumerate([r["id"], r["name"], r["tipo"]]):
-                it=QTableWidgetItem("" if val is None else str(val))
-                if c==0: it.setFlags(it.flags() & ~Qt.ItemIsEditable)
-                self.tblCat.setItem(row,c,it)
-        if rows: self.tblCat.selectRow(0); self.load_subs(0,0,0,0)
+            row = self.tblCat.rowCount()
+            self.tblCat.insertRow(row)
+            for c, val in enumerate([r["id"], r["name"], r["tipo"]]):
+                it = QTableWidgetItem("" if val is None else str(val))
+                if c == 0:
+                    it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+                self.tblCat.setItem(row, c, it)
+        if rows:
+            self.tblCat.selectRow(0)
+            self.load_subs(0, 0, 0, 0)
 
     def load_subs(self, *args):
-        r=self.tblCat.currentRow()
+        r = self.tblCat.currentRow()
         self.tblSub.setRowCount(0)
-        if r<0: return
-        id_txt=self.tblCat.item(r,0).text()
-        if not id_txt.strip().isdigit(): return
+        if r < 0:
+            return
+        id_txt = self.tblCat.item(r, 0).text() if self.tblCat.item(r, 0) else ""
+        if not id_txt.strip().isdigit():
+            return
         for s in self.db.subcategories(int(id_txt)):
-            row=self.tblSub.rowCount(); self.tblSub.insertRow(row)
-            it0=QTableWidgetItem(str(s["id"])); it0.setFlags(it0.flags() & ~Qt.ItemIsEditable)
-            self.tblSub.setItem(row,0,it0)
-            self.tblSub.setItem(row,1,QTableWidgetItem(s["name"]))
+            row = self.tblSub.rowCount()
+            self.tblSub.insertRow(row)
+            it0 = QTableWidgetItem(str(s["id"]))
+            it0.setFlags(it0.flags() & ~Qt.ItemIsEditable)
+            self.tblSub.setItem(row, 0, it0)
+            self.tblSub.setItem(row, 1, QTableWidgetItem(s["name"]))
 
+    # ----------------- helpers -----------------
+    def _current_cat_row(self):
+        return self.tblCat.currentRow()
+
+    def _current_cat_fields(self):
+        """Retorna (row, id_txt, name, tipo)."""
+        row = self._current_cat_row()
+        if row < 0:
+            return -1, "", "", self.cbTipo.currentText()
+        id_txt = self.tblCat.item(row, 0).text() if self.tblCat.item(row, 0) else ""
+        name = self.tblCat.item(row, 1).text() if self.tblCat.item(row, 1) else ""
+        tipo = self.tblCat.item(row, 2).text() if self.tblCat.item(row, 2) else self.cbTipo.currentText()
+        return row, id_txt, name.strip(), (tipo or self.cbTipo.currentText())
+
+    def _ensure_current_category_saved(self):
+        """
+        Garante que a categoria atual possua ID no banco.
+        - Se já tem ID, retorna int(ID).
+        - Se não tem, salva e devolve o novo ID (sem recarregar a tela).
+        """
+        row, id_txt, name, tipo = self._current_cat_fields()
+        if row < 0:
+            msg_err("Selecione ou crie uma categoria.")
+            return None
+        if id_txt.strip().isdigit():
+            return int(id_txt)
+        if not name:
+            msg_err("Informe o nome da categoria antes de salvar a subcategoria.")
+            return None
+        try:
+            cid = self.db.category_save(self.company_id, name, tipo, None)
+            self.tblCat.setItem(row, 0, QTableWidgetItem(str(cid)))
+            return cid
+        except sqlite3.IntegrityError as e:
+            msg_err("Não foi possível salvar a categoria (duplicada?).")
+            return None
+
+    # ----------------- ações categorias -----------------
     def add_cat(self):
-        r=self.tblCat.rowCount(); self.tblCat.insertRow(r); self.tblCat.setItem(r,0,QTableWidgetItem(""))
-        self.tblCat.setItem(r,2,QTableWidgetItem(self.cbTipo.currentText()))
+        r = self.tblCat.rowCount()
+        self.tblCat.insertRow(r)
+        self.tblCat.setItem(r, 0, QTableWidgetItem(""))  # ID vazio
+        self.tblCat.setItem(r, 1, QTableWidgetItem(""))  # nome
+        self.tblCat.setItem(r, 2, QTableWidgetItem(self.cbTipo.currentText()))
+        self.tblCat.selectRow(r)
+        self.tblSub.setRowCount(0)
+
     def save_cat(self):
+        """Salva todas as categorias listadas."""
+        ok_any = False
         for r in range(self.tblCat.rowCount()):
-            id_txt=self.tblCat.item(r,0).text() if self.tblCat.item(r,0) else ""
-            name=self.tblCat.item(r,1).text() if self.tblCat.item(r,1) else ""
-            tipo=self.tblCat.item(r,2).text() if self.tblCat.item(r,2) else self.cbTipo.currentText()
-            if not name: msg_err("Nome da categoria é obrigatório."); return
-            cid=int(id_txt) if id_txt.strip().isdigit() else None
-            cid=self.db.category_save(self.company_id, name, tipo, cid)
-            self.tblCat.setItem(r,0,QTableWidgetItem(str(cid)))
-        msg_info("Categorias salvas."); self.load()
+            id_txt = self.tblCat.item(r, 0).text() if self.tblCat.item(r, 0) else ""
+            name = self.tblCat.item(r, 1).text().strip() if self.tblCat.item(r, 1) else ""
+            tipo = self.tblCat.item(r, 2).text().strip() if self.tblCat.item(r, 2) else self.cbTipo.currentText()
+            if not name:
+                continue
+            cid = int(id_txt) if id_txt.strip().isdigit() else None
+            try:
+                cid = self.db.category_save(self.company_id, name, tipo, cid)
+                self.tblCat.setItem(r, 0, QTableWidgetItem(str(cid)))
+                ok_any = True
+            except sqlite3.IntegrityError:
+                msg_err(f"Categoria '{name}' já existe para este tipo.")
+                return False
+        if ok_any:
+            return True
+        return False
+
+    def save_cat_and_subs(self):
+        """Botão 'Salvar Cat.' também salva subcategorias da categoria atual."""
+        if not self.save_cat():
+            return
+        # salva as subs da categoria selecionada
+        self.save_sub(show_msg=False)
+        msg_info("Categorias e subcategorias salvas.")
+        # Recarrega a lista de subcategorias da categoria atual
+        self.load_subs()
+
     def del_cat(self):
-        r=self.tblCat.currentRow()
-        if r<0: return
-        id_txt=self.tblCat.item(r,0).text() if self.tblCat.item(r,0) else ""
-        if not id_txt.strip().isdigit(): self.tblCat.removeRow(r); return
-        if not msg_yesno("Excluir esta categoria e suas subcategorias?"): return
-        try: self.db.category_delete(int(id_txt))
-        except sqlite3.IntegrityError as e: msg_err("Não foi possível excluir. Existem lançamentos vinculados.\n"+str(e)); return
+        r = self.tblCat.currentRow()
+        if r < 0:
+            return
+        id_txt = self.tblCat.item(r, 0).text() if self.tblCat.item(r, 0) else ""
+        if not id_txt.strip().isdigit():
+            self.tblCat.removeRow(r)
+            self.tblSub.setRowCount(0)
+            return
+        if not msg_yesno("Excluir esta categoria e suas subcategorias?"):
+            return
+        try:
+            self.db.category_delete(int(id_txt))
+        except sqlite3.IntegrityError as e:
+            msg_err("Não foi possível excluir. Existem lançamentos vinculados.\n" + str(e))
+            return
         self.load()
 
+    # ----------------- ações subcategorias -----------------
     def add_sub(self):
-        r=self.tblCat.currentRow()
-        if r<0: msg_err("Selecione uma categoria."); return
-        self.tblSub.insertRow(self.tblSub.rowCount())
-        self.tblSub.setItem(self.tblSub.rowCount()-1,0,QTableWidgetItem(""))
-    def save_sub(self):
-        rc=self.tblCat.currentRow()
-        if rc<0: msg_err("Selecione uma categoria."); return
-        cat_id_txt=self.tblCat.item(rc,0).text()
-        if not cat_id_txt.strip().isdigit(): msg_err("Salve a categoria antes."); return
-        cat_id=int(cat_id_txt)
+        if self._current_cat_row() < 0:
+            msg_err("Selecione uma categoria.")
+            return
+        r = self.tblSub.rowCount()
+        self.tblSub.insertRow(r)
+        self.tblSub.setItem(r, 0, QTableWidgetItem(""))   # ID vazio
+        self.tblSub.setItem(r, 1, QTableWidgetItem(""))   # NOME (criado agora para permitir digitar)
+        self.tblSub.editItem(self.tblSub.item(r, 1))
+
+    def save_sub(self, show_msg=True):
+        """
+        Salva todas as subcategorias da categoria atual.
+        - Se a categoria ainda não existir no banco, salva primeiro e usa o novo ID.
+        """
+        cat_id = self._ensure_current_category_saved()
+        if not cat_id:
+            return
+
+        any_saved = False
         for r in range(self.tblSub.rowCount()):
-            id_txt=self.tblSub.item(r,0).text() if self.tblSub.item(r,0) else ""
-            name=self.tblSub.item(r,1).text() if self.tblSub.item(r,1) else ""
-            if not name: msg_err("Nome da subcategoria é obrigatório."); return
-            sid=int(id_txt) if id_txt.strip().isdigit() else None
-            sid=self.db.subcategory_save(cat_id, name, sid)
-            self.tblSub.setItem(r,0,QTableWidgetItem(str(sid)))
-        msg_info("Subcategorias salvas."); self.load_subs()
+            id_txt = self.tblSub.item(r, 0).text() if self.tblSub.item(r, 0) else ""
+            name = self.tblSub.item(r, 1).text().strip() if self.tblSub.item(r, 1) else ""
+            if not name:
+                continue
+            sid = int(id_txt) if id_txt.strip().isdigit() else None
+            try:
+                sid = self.db.subcategory_save(cat_id, name, sid)
+                self.tblSub.setItem(r, 0, QTableWidgetItem(str(sid)))
+                any_saved = True
+            except sqlite3.IntegrityError:
+                msg_err(f"Subcategoria '{name}' já existe nesta categoria.")
+                return
+
+        if show_msg and any_saved:
+            msg_info("Subcategorias salvas.")
+        # Recarrega para refletir o que ficou gravado
+        self.load_subs()
+
     def del_sub(self):
-        r=self.tblSub.currentRow()
-        if r<0: return
-        id_txt=self.tblSub.item(r,0).text() if self.tblSub.item(r,0) else ""
-        if not id_txt.strip().isdigit(): self.tblSub.removeRow(r); return
-        if not msg_yesno("Excluir esta subcategoria?"): return
-        try: self.db.subcategory_delete(int(id_txt))
-        except sqlite3.IntegrityError as e: msg_err("Não foi possível excluir. Há lançamentos vinculados.\n"+str(e)); return
+        r = self.tblSub.currentRow()
+        if r < 0:
+            return
+        id_txt = self.tblSub.item(r, 0).text() if self.tblSub.item(r, 0) else ""
+        if not id_txt.strip().isdigit():
+            self.tblSub.removeRow(r)
+            return
+        if not msg_yesno("Excluir esta subcategoria?"):
+            return
+        try:
+            self.db.subcategory_delete(int(id_txt))
+        except sqlite3.IntegrityError as e:
+            msg_err("Não foi possível excluir. Há lançamentos vinculados.\n" + str(e))
+            return
         self.load_subs()
 
 # =============================================================================
@@ -1187,33 +1403,63 @@ def set_combo_by_data(cb: QComboBox, value):
         cb.setCurrentIndex(idx)
 
 class TransactionsDialog(QDialog):
+    # sinal para notificar alterações ao dashboard
+    data_changed = pyqtSignal()
+
     def __init__(self, db: DB, company_id: int, user_id: int, parent=None):
-        super().__init__(parent); self.db=db; self.company_id=company_id; self.user_id=user_id
+        super().__init__(parent)
+        self.db = db
+        self.company_id = company_id
+        self.user_id = user_id
         self.setWindowTitle("Lançamentos - Contas a Pagar / Receber")
         self.editing_tx_id = None
 
-        self.rbPagar=QRadioButton("Contas a Pagar"); self.rbReceber=QRadioButton("Contas a Receber")
-        self.rbPagar.setChecked(True); self.rbPagar.toggled.connect(self.load)
-        top=QHBoxLayout(); top.addWidget(self.rbPagar); top.addWidget(self.rbReceber); top.addStretch()
+        # --- topo: escolher tipo ---
+        self.rbPagar = QRadioButton("Contas a Pagar")
+        self.rbReceber = QRadioButton("Contas a Receber")
+        self.rbPagar.setChecked(True)
+        # ao mudar o tipo, recarregar combos + grade
+        self.rbPagar.toggled.connect(self.on_tipo_changed)
+        self.rbReceber.toggled.connect(self.on_tipo_changed)
 
-        self.cbEnt=QComboBox(); self.cbCat=QComboBox(); self.cbSub=QComboBox()
-        self.cbForma=QComboBox(); self.cbForma.addItems(["Boleto","PIX","Transferência","Dinheiro"])
-        self.cbBanco=QComboBox()
+        top = QHBoxLayout()
+        top.addWidget(self.rbPagar)
+        top.addWidget(self.rbReceber)
+        top.addStretch()
 
-        self.dtLanc=QDateEdit(QDate.currentDate()); set_br_date(self.dtLanc)
-        self.dtVenc=QDateEdit(QDate.currentDate()); set_br_date(self.dtVenc)
-        self.edDesc=QLineEdit(); self.edValor=BRLCurrencyLineEdit(); self.edValor.setValue(0.0)
-        self.spParcelas=QSpinBox(); self.spParcelas.setRange(1,120); self.spParcelas.setValue(1)
+        # --- filtros/campos de edição ---
+        self.cbEnt = QComboBox()
+        self.cbCat = QComboBox()
+        self.cbSub = QComboBox()
+        self.cbForma = QComboBox(); self.cbForma.addItems(["Boleto", "PIX", "Transferência", "Dinheiro"])
+        self.cbBanco = QComboBox()
 
-        form=QFormLayout()
-        for label, w in [("Fornecedor/Cliente:",self.cbEnt),("Categoria:",self.cbCat),("Subcategoria:",self.cbSub),
-                         ("Descrição:",self.edDesc),("Data Lanç.:",self.dtLanc),("Data Venc.:",self.dtVenc),
-                         ("Forma Pagto:",self.cbForma),("Qtd Parcelas:",self.spParcelas),
-                         ("Banco padr.:",self.cbBanco),("Valor (total):",self.edValor)]:
+        self.dtLanc = QDateEdit(QDate.currentDate()); set_br_date(self.dtLanc)
+        self.dtVenc = QDateEdit(QDate.currentDate()); set_br_date(self.dtVenc)
+        self.edDesc = QLineEdit()
+        self.edValor = BRLCurrencyLineEdit(); self.edValor.setValue(0.0)
+        self.spParcelas = QSpinBox(); self.spParcelas.setRange(1, 120); self.spParcelas.setValue(1)
+
+        form = QFormLayout()
+        for label, w in [
+            ("Fornecedor/Cliente:", self.cbEnt),
+            ("Categoria:", self.cbCat),
+            ("Subcategoria:", self.cbSub),
+            ("Descrição:", self.edDesc),
+            ("Data Lanç.:", self.dtLanc),
+            ("Data Venc.:", self.dtVenc),
+            ("Forma Pagto:", self.cbForma),
+            ("Qtd Parcelas:", self.spParcelas),
+            ("Banco padr.:", self.cbBanco),
+            ("Valor (total):", self.edValor),
+        ]:
             form.addRow(label, w)
 
-        self.table=QTableWidget(0,10)
-        self.table.setHorizontalHeaderLabels(["ID","Tipo","Entidade","Categoria","Subcat","Descrição","Lançamento","Vencimento","Valor","Status/Pago"])
+        # --- tabela ---
+        self.table = QTableWidget(0, 10)
+        self.table.setHorizontalHeaderLabels(
+            ["ID", "Tipo", "Entidade", "Categoria", "Subcat", "Descrição", "Lançamento", "Vencimento", "Valor", "Status/Pago"]
+        )
         stretch_table(self.table); zebra_table(self.table)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -1221,24 +1467,202 @@ class TransactionsDialog(QDialog):
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._open_menu)
 
-        btNovo=QPushButton("Novo"); btSalvar=QPushButton("Salvar"); btExcluir=QPushButton("Excluir")
-        btLiquidar=QPushButton("Liquidar"); btEstornar=QPushButton("Estornar baixa")
-        btPdf=QPushButton("PDF da lista"); btXls=QPushButton("Excel da lista")
-        for b,ic in ((btNovo,self.style().SP_FileDialogNewFolder),(btSalvar,self.style().SP_DialogSaveButton),
-                     (btExcluir,self.style().SP_TrashIcon),(btLiquidar,self.style().SP_DialogApplyButton),
-                     (btEstornar,self.style().SP_ArrowBack),(btPdf,self.style().SP_DriveDVDIcon),
-                     (btXls,self.style().SP_DialogSaveButton)):
+        # --- botões ---
+        btNovo     = QPushButton("Novo")
+        btSalvar   = QPushButton("Salvar")
+        btExcluir  = QPushButton("Excluir")
+        btLiquidar = QPushButton("Liquidar")
+        btEstornar = QPushButton("Estornar baixa")
+        btPdf      = QPushButton("PDF da lista")
+        btXls      = QPushButton("Excel da lista")
+        for b, ic in (
+            (btNovo, self.style().SP_FileDialogNewFolder),
+            (btSalvar, self.style().SP_DialogSaveButton),
+            (btExcluir, self.style().SP_TrashIcon),
+            (btLiquidar, self.style().SP_DialogApplyButton),
+            (btEstornar, self.style().SP_ArrowBack),
+            (btPdf, self.style().SP_DriveDVDIcon),
+            (btXls, self.style().SP_DialogSaveButton),
+        ):
             b.setIcon(std_icon(self, ic))
-        btNovo.clicked.connect(self.new); btSalvar.clicked.connect(self.save); btExcluir.clicked.connect(self.delete)
-        btLiquidar.clicked.connect(self.liquidar); btEstornar.clicked.connect(self.estornar)
-        btPdf.clicked.connect(lambda: export_pdf_from_table(self,self.table,"Lancamentos"))
-        btXls.clicked.connect(lambda: export_excel_from_table(self,self.table,"Lancamentos"))
+        btNovo.clicked.connect(self.new)
+        btSalvar.clicked.connect(self.save)
+        btExcluir.clicked.connect(self.delete)
+        btLiquidar.clicked.connect(self.liquidar)
+        btEstornar.clicked.connect(self.estornar)
+        btPdf.clicked.connect(lambda: export_pdf_from_table(self, self.table, "Lancamentos"))
+        btXls.clicked.connect(lambda: export_excel_from_table(self, self.table, "Lancamentos"))
 
-        lay=QVBoxLayout(self); lay.addLayout(top); lay.addLayout(form); lay.addWidget(self.table)
-        hl=QHBoxLayout(); [hl.addWidget(b) for b in (btNovo,btSalvar,btExcluir,btLiquidar,btEstornar,btPdf,btXls)]; lay.addLayout(hl)
+        lay = QVBoxLayout(self)
+        lay.addLayout(top)
+        lay.addLayout(form)
+        lay.addWidget(self.table)
+        hl = QHBoxLayout(); [hl.addWidget(b) for b in (btNovo, btSalvar, btExcluir, btLiquidar, btEstornar, btPdf, btXls)]
+        lay.addLayout(hl)
 
-        self.populate_static(); self.load(); enable_autosize(self, 0.9, 0.85, 1200, 720)
+        self.populate_static()
+        self.load()
+        enable_autosize(self, 0.9, 0.85, 1200, 720)
 
+    # ---------------- util ----------------
+    def tipo(self) -> str:
+        return "PAGAR" if self.rbPagar.isChecked() else "RECEBER"
+
+    def on_tipo_changed(self, _checked: bool):
+        """Quando alterna Pagar/Receber, filtra combos por tipo e recarrega a grade."""
+        self.editing_tx_id = None
+        self.reload_cats_ents()
+        self.load()
+
+    def populate_static(self):
+        # bancos
+        self.cbBanco.clear()
+        for b in self.db.banks(self.company_id):
+            self.cbBanco.addItem(f"{b['bank_name']} - {b['account_name'] or ''}", b["id"])
+        # entidades/categorias/subcategorias (já filtrados por tipo)
+        self.reload_cats_ents()
+
+    def reload_cats_ents(self):
+        # entidades: fornecedor para PAGAR, cliente para RECEBER
+        self.cbEnt.clear()
+        kind = "FORNECEDOR" if self.tipo() == "PAGAR" else "CLIENTE"
+        for e in self.db.entities(self.company_id, kind):
+            self.cbEnt.addItem(e["razao_social"], e["id"])
+
+        # categorias: **somente** do tipo atual
+        self.cbCat.blockSignals(True)
+        self.cbCat.clear()
+        for c in self.db.categories(self.company_id, self.tipo()):
+            self.cbCat.addItem(c["name"], c["id"])
+        self.cbCat.blockSignals(False)
+
+        # evita múltiplas conexões do sinal
+        try:
+            self.cbCat.currentIndexChanged.disconnect()
+        except TypeError:
+            pass
+        self.cbCat.currentIndexChanged.connect(self.reload_subs)
+
+        # subcategorias da categoria atual
+        self.reload_subs()
+
+    def reload_subs(self):
+        self.cbSub.clear()
+        cat_id = self.cbCat.currentData()
+        if not cat_id:
+            return
+        for s in self.db.subcategories(cat_id):
+            self.cbSub.addItem(s["name"], s["id"])
+
+    # ---------------- grade ----------------
+    def load(self):
+        rows = self.db.transactions(self.company_id, self.tipo())
+        self.table.setRowCount(0)
+        for r in rows:
+            row = self.table.rowCount(); self.table.insertRow(row)
+            ent = self.db.q("SELECT razao_social FROM entities WHERE id=?", (r["entity_id"],))
+            cat = self.db.q("SELECT name FROM categories WHERE id=?", (r["category_id"],))
+            sub = self.db.q("SELECT name FROM subcategories WHERE id=?", (r["subcategory_id"],))
+            ent_name = ent[0]["razao_social"] if ent else ""
+            cat_name = cat[0]["name"] if cat else ""
+            sub_name = sub[0]["name"] if sub else ""
+            data = [
+                r["id"], r["tipo"], ent_name, cat_name, sub_name, r["descricao"],
+                iso_to_br(r["data_lanc"]), iso_to_br(r["data_venc"]),
+                fmt_brl(r["valor"]), f"{r['status']} / pago {fmt_brl(r['pago'])}"
+            ]
+            for c, val in enumerate(data):
+                it = QTableWidgetItem("" if val is None else str(val))
+                if c == 0:
+                    it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+                self.table.setItem(row, c, it)
+
+    # ---------------- ações ----------------
+    def new(self):
+        self.editing_tx_id = None
+        self.edDesc.clear()
+        self.edValor.setValue(0.0)
+        self.spParcelas.setValue(1)
+        self.dtLanc.setDate(QDate.currentDate())
+        self.dtVenc.setDate(QDate.currentDate())
+
+    def save(self):
+        rec = dict(
+            company_id=self.company_id,
+            tipo=self.tipo(),
+            entity_id=self.cbEnt.currentData(),
+            category_id=self.cbCat.currentData(),
+            subcategory_id=self.cbSub.currentData(),
+            descricao=self.edDesc.text(),
+            data_lanc=qdate_to_iso(self.dtLanc.date()),
+            data_venc=qdate_to_iso(self.dtVenc.date()),
+            forma_pagto=self.cbForma.currentText(),
+            parcelas_qtd=int(self.spParcelas.value()),
+            valor=self.edValor.value(),
+            banco_id_padrao=self.cbBanco.currentData(),
+            created_by=self.user_id,
+        )
+        try:
+            self.db.transaction_save(rec, self.editing_tx_id)
+        except sqlite3.IntegrityError as e:
+            msg_err(str(e)); return
+        msg_info("Lançamento salvo.")
+        self.editing_tx_id = None
+        self.load()
+        self.data_changed.emit()  # atualiza dashboard
+
+    def current_tx(self):
+        r = self.table.currentRow()
+        if r < 0:
+            return None
+        tx_id = int(self.table.item(r, 0).text())
+        sql = """SELECT t.*, IFNULL((SELECT SUM(p.amount+p.interest-p.discount)
+                 FROM payments p WHERE p.transaction_id=t.id),0) AS pago
+                 FROM transactions t WHERE t.id=?"""
+        res = self.db.q(sql, (tx_id,))
+        return res[0] if res else None
+
+    def delete(self):
+        tx = self.current_tx()
+        if not tx:
+            return
+        if not msg_yesno("Excluir este lançamento?"):
+            return
+        try:
+            self.db.transaction_delete(tx["id"])
+        except sqlite3.IntegrityError as e:
+            msg_err(str(e)); return
+        self.load()
+        self.data_changed.emit()
+
+    def liquidar(self):
+        tx = self.current_tx()
+        if not tx:
+            msg_err("Selecione um lançamento."); return
+        dlg = PaymentDialog(self.db, self.company_id, tx, self.user_id, self)
+        if dlg.exec_() and dlg.ok_clicked:
+            msg_info("Baixa registrada.")
+            self.load()
+            self.data_changed.emit()
+
+    def estornar(self):
+        tx = self.current_tx()
+        if not tx:
+            return
+        pays = self.db.payments_for(tx["id"])
+        if not pays:
+            msg_err("Não há baixas para estornar."); return
+        last_id = pays[-1]["id"]
+        if not msg_yesno(f"Estornar a última baixa (ID {last_id})?"):
+            return
+        try:
+            self.db.payment_delete(last_id)
+        except sqlite3.IntegrityError as e:
+            msg_err(str(e)); return
+        self.load()
+        self.data_changed.emit()
+
+    # ---------------- menu contextual ----------------
     def _open_menu(self, pos: QPoint):
         row = self.table.currentRow()
         if row < 0:
@@ -1253,10 +1677,12 @@ class TransactionsDialog(QDialog):
         tx = self.current_tx()
         if not tx:
             return
+        # ajusta radio sem disparar recarga dupla
         self.rbPagar.blockSignals(True); self.rbReceber.blockSignals(True)
         self.rbPagar.setChecked(tx["tipo"] == "PAGAR")
         self.rbReceber.setChecked(tx["tipo"] == "RECEBER")
         self.rbPagar.blockSignals(False); self.rbReceber.blockSignals(False)
+        # garantir filtros corretos
         self.reload_cats_ents()
         set_combo_by_data(self.cbEnt, tx["entity_id"])
         set_combo_by_data(self.cbCat, tx["category_id"])
@@ -1270,102 +1696,6 @@ class TransactionsDialog(QDialog):
         set_combo_by_data(self.cbBanco, tx["banco_id_padrao"])
         self.edValor.setValue(float(tx["valor"]))
         self.editing_tx_id = int(tx["id"])
-
-    def tipo(self): return "PAGAR" if self.rbPagar.isChecked() else "RECEBER"
-
-    def populate_static(self):
-        self.cbBanco.clear()
-        for b in self.db.banks(self.company_id):
-            self.cbBankText = f"{b['bank_name']} - {b['account_name'] or ''}"
-            self.cbBanco.addItem(self.cbBankText, b["id"])
-        self.reload_cats_ents()
-
-    def reload_cats_ents(self):
-        self.cbEnt.clear(); kind = "FORNECEDOR" if self.tipo()=="PAGAR" else "CLIENTE"
-        for e in self.db.entities(self.company_id, kind):
-            self.cbEnt.addItem(e["razao_social"], e["id"])
-        self.cbCat.clear()
-        for c in self.db.categories(self.company_id, self.tipo()):
-            self.cbCat.addItem(c["name"], c["id"])
-        self.cbCat.currentIndexChanged.connect(self.reload_subs)
-        self.reload_subs()
-
-    def reload_subs(self):
-        self.cbSub.clear(); cat_id=self.cbCat.currentData()
-        if not cat_id: return
-        for s in self.db.subcategories(cat_id):
-            self.cbSub.addItem(s["name"], s["id"])
-
-    def load(self):
-        rows = self.db.transactions(self.company_id, self.tipo())
-        self.table.setRowCount(0)
-        for r in rows:
-            row=self.table.rowCount(); self.table.insertRow(row)
-            ent=self.db.q("SELECT razao_social FROM entities WHERE id=?", (r["entity_id"],))
-            cat=self.db.q("SELECT name FROM categories WHERE id=?", (r["category_id"],))
-            sub=self.db.q("SELECT name FROM subcategories WHERE id=?", (r["subcategory_id"],))
-            ent_name=ent[0]["razao_social"] if ent else ""; cat_name=cat[0]["name"] if cat else ""; sub_name=sub[0]["name"] if sub else ""
-            data=[r["id"], r["tipo"], ent_name, cat_name, sub_name, r["descricao"],
-                  iso_to_br(r["data_lanc"]), iso_to_br(r["data_venc"]),
-                  fmt_brl(r["valor"]), f"{r['status']} / pago {fmt_brl(r['pago'])}"]
-            for c,val in enumerate(data):
-                it=QTableWidgetItem("" if val is None else str(val))
-                if c==0: it.setFlags(it.flags() & ~Qt.ItemIsEditable)
-                self.table.setItem(row,c,it)
-
-    def new(self):
-        self.editing_tx_id = None
-        self.edDesc.clear(); self.edValor.setValue(0.0); self.spParcelas.setValue(1)
-        self.dtLanc.setDate(QDate.currentDate()); self.dtVenc.setDate(QDate.currentDate())
-
-    def save(self):
-        rec=dict(company_id=self.company_id, tipo=self.tipo(), entity_id=self.cbEnt.currentData(),
-                 category_id=self.cbCat.currentData(), subcategory_id=self.cbSub.currentData(),
-                 descricao=self.edDesc.text(), data_lanc=qdate_to_iso(self.dtLanc.date()), data_venc=qdate_to_iso(self.dtVenc.date()),
-                 forma_pagto=self.cbForma.currentText(), parcelas_qtd=int(self.spParcelas.value()),
-                 valor=self.edValor.value(), banco_id_padrao=self.cbBanco.currentData(), created_by=self.user_id)
-        try:
-            self.db.transaction_save(rec, self.editing_tx_id)
-        except sqlite3.IntegrityError as e:
-            msg_err(str(e)); return
-        msg_info("Lançamento salvo.")
-        self.editing_tx_id = None
-        self.load()
-
-    def current_tx(self):
-        r=self.table.currentRow()
-        if r<0: return None
-        tx_id=int(self.table.item(r,0).text())
-        sql="""SELECT t.*, IFNULL((SELECT SUM(p.amount+p.interest-p.discount) FROM payments p WHERE p.transaction_id=t.id),0) AS pago
-               FROM transactions t WHERE t.id=?"""
-        res = self.db.q(sql, (tx_id,))
-        return res[0] if res else None
-
-    def delete(self):
-        tx=self.current_tx()
-        if not tx: return
-        if not msg_yesno("Excluir este lançamento?"): return
-        try: self.db.transaction_delete(tx["id"])
-        except sqlite3.IntegrityError as e: msg_err(str(e)); return
-        self.load()
-
-    def liquidar(self):
-        tx=self.current_tx()
-        if not tx: msg_err("Selecione um lançamento."); return
-        dlg=PaymentDialog(self.db, self.company_id, tx, self.user_id, self)
-        if dlg.exec_() and dlg.ok_clicked:
-            msg_info("Baixa registrada."); self.load()
-
-    def estornar(self):
-        tx=self.current_tx()
-        if not tx: return
-        pays=self.db.payments_for(tx["id"])
-        if not pays: msg_err("Não há baixas para estornar."); return
-        last_id=pays[-1]["id"]
-        if not msg_yesno(f"Estornar a última baixa (ID {last_id})?"): return
-        try: self.db.payment_delete(last_id)
-        except sqlite3.IntegrityError as e: msg_err(str(e)); return
-        self.load()
 
 class CashflowDialog(QDialog):
     def __init__(self, db: DB, company_id: int, parent=None):
@@ -1832,7 +2162,14 @@ class MainWindow(QMainWindow):
         if self.ensure("CONTAS"): CategoriesDialog(self.db, self.company_id, self).exec_()
 
     def open_transactions(self):
-        if self.ensure("CONTAS"): TransactionsDialog(self.db, self.company_id, self.user["id"], self).exec_()
+        if not self.ensure("CONTAS"):
+            return
+        dlg = TransactionsDialog(self.db, self.company_id, self.user["id"], self)
+        # atualiza dashboard sempre que houver mudança, mesmo com o diálogo aberto
+        dlg.data_changed.connect(self.update_dashboard)
+        dlg.exec_()
+        # garante atualização ao fechar também
+        self.update_dashboard()
 
     def open_cashflow(self):
         if self.ensure("CONTAS"): CashflowDialog(self.db, self.company_id, self).exec_()
