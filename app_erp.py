@@ -396,297 +396,691 @@ def ensure_db():
         admin_id = cur.lastrowid
         cur.execute("INSERT OR IGNORE INTO user_company_access(user_id, company_id) VALUES(?,1)", (admin_id,))
         for (pid,) in conn.execute("SELECT id FROM permission_types"):
-            conn.execute("INSERT OR REPLACE INTO user_permissions(user_id, perm_id, allowed) VALUES(?,?,1)",
+            conn.execute("INSERT OR REPLACE INTO user_permissions(user_id,perm_id,allowed) VALUES(?,?,1)",
                          (admin_id, pid))
         conn.execute("INSERT OR REPLACE INTO app_meta(key,value) VALUES('schema_version','1')")
         conn.commit()
+
+    # <<< ADICIONE ESTA LINHA >>>
+    seed_default_categories(conn)
+
     conn.row_factory = sqlite3.Row
     return conn
+def seed_default_categories(conn: sqlite3.Connection) -> None:
+    """
+    Garante categorias/subcategorias padrão:
+      - PAGAR: DESPESAS COM IMPOSTOS -> COFINS, CSLL, IRPJ, PIS
+      - RECEBER: PRESTACAO DE SERVICOS -> SERVIÇO PRESTADO
+    Executa de forma idempotente (INSERT OR IGNORE).
+    """
+    cur = conn.cursor()
+    companies = cur.execute("SELECT id FROM companies").fetchall()
+    for (cid,) in companies:
+        # --- PAGAR / DESPESAS COM IMPOSTOS
+        cur.execute(
+            "INSERT OR IGNORE INTO categories(company_id, name, tipo) VALUES (?, ?, 'PAGAR')",
+            (cid, "DESPESAS COM IMPOSTOS"),
+        )
+        cat_tax = cur.execute(
+            "SELECT id FROM categories WHERE company_id=? AND name=? AND tipo='PAGAR'",
+            (cid, "DESPESAS COM IMPOSTOS")
+        ).fetchone()
+        if cat_tax:
+            cat_id = cat_tax[0]
+            for sub in ["COFINS", "CSLL", "IRPJ", "PIS"]:
+                cur.execute(
+                    "INSERT OR IGNORE INTO subcategories(category_id, name) VALUES (?, ?)",
+                    (cat_id, sub)
+                )
 
+        # --- RECEBER / PRESTACAO DE SERVICOS
+        cur.execute(
+            "INSERT OR IGNORE INTO categories(company_id, name, tipo) VALUES (?, ?, 'RECEBER')",
+            (cid, "PRESTACAO DE SERVICOS"),
+        )
+        cat_rec = cur.execute(
+            "SELECT id FROM categories WHERE company_id=? AND name=? AND tipo='RECEBER'",
+            (cid, "PRESTACAO DE SERVICOS")
+        ).fetchone()
+        if cat_rec:
+            cur.execute(
+                "INSERT OR IGNORE INTO subcategories(category_id, name) VALUES (?, ?)",
+                (cat_rec[0], "SERVIÇO PRESTADO")
+            )
+
+    conn.commit()
 # =============================================================================
 # Dados
 # =============================================================================
 class DB:
     def __init__(self, conn: sqlite3.Connection):
-        self.conn = conn; self.conn.row_factory = sqlite3.Row
-    def q(self, sql, params=()): return self.conn.execute(sql, params).fetchall()
-    def e(self, sql, params=()):
-        cur = self.conn.execute(sql, params); self.conn.commit(); return cur.lastrowid
+        self.conn = conn
+        self.conn.row_factory = sqlite3.Row
 
-    # Login/ACL
+    # utilidades básicas
+    def q(self, sql, params=()):
+        return self.conn.execute(sql, params).fetchall()
+
+    def e(self, sql, params=()):
+        cur = self.conn.execute(sql, params)
+        self.conn.commit()
+        return cur.lastrowid
+
+    # ---------------------- LOGIN / ACL ----------------------
     def list_companies(self):
-        return self.q("SELECT id, razao_social FROM companies WHERE active=1 ORDER BY razao_social")
+        return self.q(
+            "SELECT id, razao_social FROM companies WHERE active=1 ORDER BY razao_social"
+        )
+
     def list_users_for_company(self, company_id):
-        sql = """SELECT u.id,u.name,u.username FROM users u
-                 JOIN user_company_access a ON a.user_id=u.id
-                 WHERE a.company_id=? AND u.active=1 ORDER BY u.name"""
+        sql = """
+            SELECT u.id, u.name, u.username
+              FROM users u
+              JOIN user_company_access a ON a.user_id = u.id
+             WHERE a.company_id = ? AND u.active = 1
+             ORDER BY u.name
+        """
         return self.q(sql, (company_id,))
+
     def verify_login(self, company_id, username, password):
-        r = self.q("SELECT * FROM users WHERE username=? AND active=1", (username,))
-        if not r: return None
-        u = r[0]
+        rows = self.q(
+            "SELECT * FROM users WHERE username=? AND active=1", (username,)
+        )
+        if not rows:
+            return None
+        u = rows[0]
         calc = pbkdf2_hash(password, u["password_salt"], u["iterations"])
-        if not secure_eq(calc, u["password_hash"]): return None
-        ok = self.q("SELECT 1 FROM user_company_access WHERE user_id=? AND company_id=?", (u["id"], company_id))
-        if not ok: return None
+        if not secure_eq(calc, u["password_hash"]):
+            return None
+        ok = self.q(
+            "SELECT 1 FROM user_company_access WHERE user_id=? AND company_id=?",
+            (u["id"], company_id),
+        )
+        if not ok:
+            return None
         return u
+
     def is_admin(self, user_id):
         r = self.q("SELECT is_admin FROM users WHERE id=?", (user_id,))
         return bool(r and r[0]["is_admin"])
 
-    def allowed_codes(self, user_id: int, company_id: int) -> set:
-        """Retorna o conjunto de códigos de permissão do usuário.
-        Hoje global por usuário; pronto para evoluir por empresa."""
-        if self.is_admin(user_id):
-            return {r["code"] for r in self.q("SELECT code FROM permission_types")}
-        rows = self.q("""
-            SELECT pt.code
-              FROM permission_types pt
-              JOIN user_permissions up ON up.perm_id = pt.id
-             WHERE up.user_id = ? AND up.allowed = 1
-        """, (user_id,))
-        return {r["code"] for r in rows}
+    # ---------------------- COMPANIES ----------------------
+    def companies_all(self):
+        return self.q("SELECT * FROM companies ORDER BY razao_social")
 
-    # Companies
-    def companies_all(self): return self.q("SELECT * FROM companies ORDER BY razao_social")
     def company_save(self, rec, company_id=None):
         if company_id:
-            self.e("""UPDATE companies SET cnpj=?, razao_social=?, contato1=?, contato2=?, rua=?, bairro=?, numero=?, cep=?, uf=?, cidade=?, email=?, active=?
-                      WHERE id=?""",
-                   (rec["cnpj"], rec["razao_social"], rec["contato1"], rec["contato2"], rec["rua"], rec["bairro"], rec["numero"],
-                    rec["cep"], rec["uf"], rec["cidade"], rec["email"], int(rec["active"]), company_id))
+            self.e(
+                """UPDATE companies
+                      SET cnpj=?, razao_social=?, contato1=?, contato2=?, rua=?, bairro=?, numero=?,
+                          cep=?, uf=?, cidade=?, email=?, active=?
+                    WHERE id=?""",
+                (
+                    rec["cnpj"],
+                    rec["razao_social"],
+                    rec["contato1"],
+                    rec["contato2"],
+                    rec["rua"],
+                    rec["bairro"],
+                    rec["numero"],
+                    rec["cep"],
+                    rec["uf"],
+                    rec["cidade"],
+                    rec["email"],
+                    int(rec["active"]),
+                    company_id,
+                ),
+            )
             return company_id
-        return self.e("""INSERT INTO companies(cnpj,razao_social,contato1,contato2,rua,bairro,numero,cep,uf,cidade,email,active)
-                         VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-                       (rec["cnpj"], rec["razao_social"], rec["contato1"], rec["contato2"], rec["rua"], rec["bairro"], rec["numero"],
-                        rec["cep"], rec["uf"], rec["cidade"], rec["email"], int(rec["active"])))
-    def company_delete(self, company_id): self.e("DELETE FROM companies WHERE id=?", (company_id,))
 
-    # Users
-    def users_all(self): return self.q("SELECT * FROM users ORDER BY name")
+        return self.e(
+            """INSERT INTO companies
+               (cnpj, razao_social, contato1, contato2, rua, bairro, numero, cep, uf, cidade, email, active)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                rec["cnpj"],
+                rec["razao_social"],
+                rec["contato1"],
+                rec["contato2"],
+                rec["rua"],
+                rec["bairro"],
+                rec["numero"],
+                rec["cep"],
+                rec["uf"],
+                rec["cidade"],
+                rec["email"],
+                int(rec["active"]),
+            ),
+        )
+
+    def company_delete(self, company_id):
+        self.e("DELETE FROM companies WHERE id=?", (company_id,))
+
+    # ---------------------- USERS ----------------------
+    def users_all(self):
+        return self.q("SELECT * FROM users ORDER BY name")
+
     def user_save(self, rec, user_id=None):
         if user_id:
-            self.e("""UPDATE users SET name=?, username=?, is_admin=?, active=? WHERE id=?""",
-                   (rec["name"], rec["username"], int(rec["is_admin"]), int(rec["active"]), user_id))
+            self.e(
+                """UPDATE users
+                      SET name=?, username=?, is_admin=?, active=?
+                    WHERE id=?""",
+                (
+                    rec["name"],
+                    rec["username"],
+                    int(rec["is_admin"]),
+                    int(rec["active"]),
+                    user_id,
+                ),
+            )
             return user_id
-        salt = os.urandom(16); iters = 240_000
-        pw_hash = pbkdf2_hash(rec.get("password", "123456"), salt, iters)
-        return self.e("""INSERT INTO users(name, username, password_salt, password_hash, iterations, is_admin, active)
-                         VALUES(?,?,?,?,?,?,?)""",
-                       (rec["name"], rec["username"], salt, pw_hash, iters, int(rec["is_admin"]), int(rec["active"])))
-    def user_delete(self, user_id): self.e("DELETE FROM users WHERE id=?", (user_id,))
-    def user_set_password(self, user_id, password):
-        salt=os.urandom(16); iters=240_000; pw_hash=pbkdf2_hash(password, salt, iters)
-        self.e("UPDATE users SET password_salt=?, password_hash=?, iterations=? WHERE id=?", (salt,pw_hash,iters,user_id))
 
-    def permissions_all(self): return self.q("SELECT * FROM permission_types ORDER BY id")
+        salt = os.urandom(16)
+        iters = 240_000
+        pw_hash = pbkdf2_hash(rec.get("password", "123456"), salt, iters)
+        return self.e(
+            """INSERT INTO users
+               (name, username, password_salt, password_hash, iterations, is_admin, active)
+               VALUES (?,?,?,?,?,?,?)""",
+            (
+                rec["name"],
+                rec["username"],
+                salt,
+                pw_hash,
+                iters,
+                int(rec["is_admin"]),
+                int(rec["active"]),
+            ),
+        )
+
+    def user_delete(self, user_id):
+        self.e("DELETE FROM users WHERE id=?", (user_id,))
+
+    def user_set_password(self, user_id, password):
+        salt = os.urandom(16)
+        iters = 240_000
+        pw_hash = pbkdf2_hash(password, salt, iters)
+        self.e(
+            "UPDATE users SET password_salt=?, password_hash=?, iterations=? WHERE id=?",
+            (salt, pw_hash, iters, user_id),
+        )
+
+    def permissions_all(self):
+        return self.q("SELECT * FROM permission_types ORDER BY id")
+    def allowed_codes(self, user_id: int, company_id: int | None = None):
+        """
+        Retorna um set com os códigos de permissão habilitados para o usuário.
+        Se for admin, devolve todos os códigos.
+        company_id é ignorado aqui (acesso à empresa já foi validado no login).
+        """
+        if self.is_admin(user_id):
+            rows = self.q("SELECT code FROM permission_types")
+            return {r["code"] for r in rows}
+
+        sql = """
+            SELECT pt.code
+            FROM user_permissions up
+            JOIN permission_types pt ON pt.id = up.perm_id
+            WHERE up.user_id = ? AND up.allowed = 1
+        """
+        rows = self.q(sql, (user_id,))
+        return {r["code"] for r in rows}
+
     def user_perm_map(self, user_id):
-        rows=self.q("SELECT perm_id, allowed FROM user_permissions WHERE user_id=?", (user_id,))
+        rows = self.q(
+            "SELECT perm_id, allowed FROM user_permissions WHERE user_id=?", (user_id,)
+        )
         return {r["perm_id"]: bool(r["allowed"]) for r in rows}
+
     def set_user_permissions(self, user_id, allowed_perm_ids):
         self.e("DELETE FROM user_permissions WHERE user_id=?", (user_id,))
         for (pid,) in self.q("SELECT id FROM permission_types"):
             allow = 1 if pid in allowed_perm_ids else 0
-            self.e("INSERT INTO user_permissions(user_id,perm_id,allowed) VALUES(?,?,?)", (user_id, pid, allow))
+            self.e(
+                "INSERT INTO user_permissions(user_id, perm_id, allowed) VALUES (?,?,?)",
+                (user_id, pid, allow),
+            )
 
     def company_access_map(self, user_id):
-        rows=self.q("SELECT company_id FROM user_company_access WHERE user_id=?", (user_id,))
+        rows = self.q(
+            "SELECT company_id FROM user_company_access WHERE user_id=?", (user_id,)
+        )
         return {r["company_id"] for r in rows}
+
     def set_company_access(self, user_id, company_ids):
         self.e("DELETE FROM user_company_access WHERE user_id=?", (user_id,))
         for cid in company_ids:
-            self.e("INSERT INTO user_company_access(user_id, company_id) VALUES(?,?)", (user_id, cid))
+            self.e(
+                "INSERT INTO user_company_access(user_id, company_id) VALUES (?,?)",
+                (user_id, cid),
+            )
 
-    # Banks
-    def banks(self, company_id): return self.q("SELECT * FROM bank_accounts WHERE company_id=? ORDER BY bank_name, account_name", (company_id,))
+    # ---------------------- BANKS ----------------------
+    def banks(self, company_id):
+        return self.q(
+            "SELECT * FROM bank_accounts WHERE company_id=? ORDER BY bank_name, account_name",
+            (company_id,),
+        )
+
     def bank_save(self, company_id, rec, bank_id=None):
         if bank_id:
-            self.e("""UPDATE bank_accounts SET bank_name=?, account_name=?, account_type=?, agency=?, account_number=?,
-                      initial_balance=?, current_balance=?, active=? WHERE id=?""",
-                   (rec["bank_name"], rec["account_name"], rec["account_type"], rec["agency"], rec["account_number"],
-                    float(rec["initial_balance"]), float(rec["current_balance"]), int(rec["active"]), bank_id))
+            self.e(
+                """UPDATE bank_accounts
+                      SET bank_name=?, account_name=?, account_type=?, agency=?, account_number=?,
+                          initial_balance=?, current_balance=?, active=?
+                    WHERE id=?""",
+                (
+                    rec["bank_name"],
+                    rec["account_name"],
+                    rec["account_type"],
+                    rec["agency"],
+                    rec["account_number"],
+                    float(rec["initial_balance"]),
+                    float(rec["current_balance"]),
+                    int(rec["active"]),
+                    bank_id,
+                ),
+            )
             return bank_id
-        return self.e("""INSERT INTO bank_accounts(company_id,bank_name,account_name,account_type,agency,account_number,
-                                                   initial_balance,current_balance,active)
-                         VALUES(?,?,?,?,?,?,?,?,?)""",
-                       (company_id, rec["bank_name"], rec["account_name"], rec["account_type"], rec["agency"], rec["account_number"],
-                        float(rec["initial_balance"]), float(rec["current_balance"]), int(rec["active"])))
-    def bank_delete(self, bank_id): self.e("DELETE FROM bank_accounts WHERE id=?", (bank_id,))
 
-    # Entities
+        return self.e(
+            """INSERT INTO bank_accounts
+               (company_id, bank_name, account_name, account_type, agency, account_number,
+                initial_balance, current_balance, active)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (
+                company_id,
+                rec["bank_name"],
+                rec["account_name"],
+                rec["account_type"],
+                rec["agency"],
+                rec["account_number"],
+                float(rec["initial_balance"]),
+                float(rec["current_balance"]),
+                int(rec["active"]),
+            ),
+        )
+
+    def bank_delete(self, bank_id):
+        self.e("DELETE FROM bank_accounts WHERE id=?", (bank_id,))
+
+    # ---------------------- ENTITIES ----------------------
     def entities(self, company_id, kind=None):
         if kind:
-            return self.q("SELECT * FROM entities WHERE company_id=? AND (kind=? OR kind='AMBOS') ORDER BY razao_social", (company_id, kind))
-        return self.q("SELECT * FROM entities WHERE company_id=? ORDER BY razao_social", (company_id,))
+            return self.q(
+                """SELECT * FROM entities
+                    WHERE company_id=? AND (kind=? OR kind='AMBOS')
+                    ORDER BY razao_social""",
+                (company_id, kind),
+            )
+        return self.q(
+            "SELECT * FROM entities WHERE company_id=? ORDER BY razao_social",
+            (company_id,),
+        )
+
     def entity_save(self, company_id, rec, entity_id=None):
         if entity_id:
-            self.e("""UPDATE entities SET kind=?, cnpj_cpf=?, razao_social=?, contato1=?, contato2=?, rua=?, bairro=?, numero=?, cep=?, uf=?, cidade=?, email=?, active=?
-                      WHERE id=?""",
-                   (rec["kind"], rec["cnpj_cpf"], rec["razao_social"], rec["contato1"], rec["contato2"], rec["rua"], rec["bairro"],
-                    rec["numero"], rec["cep"], rec["uf"], rec["cidade"], rec["email"], int(rec["active"]), entity_id))
+            self.e(
+                """UPDATE entities
+                      SET kind=?, cnpj_cpf=?, razao_social=?, contato1=?, contato2=?, rua=?, bairro=?, numero=?, cep=?, uf=?, cidade=?, email=?, active=?
+                    WHERE id=?""",
+                (
+                    rec["kind"],
+                    rec["cnpj_cpf"],
+                    rec["razao_social"],
+                    rec["contato1"],
+                    rec["contato2"],
+                    rec["rua"],
+                    rec["bairro"],
+                    rec["numero"],
+                    rec["cep"],
+                    rec["uf"],
+                    rec["cidade"],
+                    rec["email"],
+                    int(rec["active"]),
+                    entity_id,
+                ),
+            )
             return entity_id
-        return self.e("""INSERT INTO entities(company_id,kind,cnpj_cpf,razao_social,contato1,contato2,rua,bairro,numero,cep,uf,cidade,email,active)
-                         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                       (company_id, rec["kind"], rec["cnpj_cpf"], rec["razao_social"], rec["contato1"], rec["contato2"],
-                        rec["rua"], rec["bairro"], rec["numero"], rec["cep"], rec["uf"], rec["cidade"], rec["email"], int(rec["active"])))
-    def entity_delete(self, entity_id): self.e("DELETE FROM entities WHERE id=?", (entity_id,))
 
-    # Categories/Subcategories
+        return self.e(
+            """INSERT INTO entities
+               (company_id, kind, cnpj_cpf, razao_social, contato1, contato2, rua, bairro, numero, cep, uf, cidade, email, active)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                company_id,
+                rec["kind"],
+                rec["cnpj_cpf"],
+                rec["razao_social"],
+                rec["contato1"],
+                rec["contato2"],
+                rec["rua"],
+                rec["bairro"],
+                rec["numero"],
+                rec["cep"],
+                rec["uf"],
+                rec["cidade"],
+                rec["email"],
+                int(rec["active"]),
+            ),
+        )
+
+    def entity_delete(self, entity_id):
+        self.e("DELETE FROM entities WHERE id=?", (entity_id,))
+
+    # ---------------------- CATEGORIES / SUBCATEGORIES ----------------------
     def categories(self, company_id, tipo=None):
         if tipo:
-            return self.q("SELECT * FROM categories WHERE company_id=? AND tipo=? ORDER BY name", (company_id, tipo))
-        return self.q("SELECT * FROM categories WHERE company_id=? ORDER BY tipo, name", (company_id,))
+            return self.q(
+                "SELECT * FROM categories WHERE company_id=? AND tipo=? ORDER BY name",
+                (company_id, tipo),
+            )
+        return self.q(
+            "SELECT * FROM categories WHERE company_id=? ORDER BY tipo, name",
+            (company_id,),
+        )
+
     def category_save(self, company_id, name, tipo, cat_id=None):
         if cat_id:
-            self.e("UPDATE categories SET name=?, tipo=? WHERE id=?", (name, tipo, cat_id)); return cat_id
-        return self.e("INSERT INTO categories(company_id,name,tipo) VALUES(?,?,?)", (company_id, name, tipo))
-    def category_delete(self, cat_id): self.e("DELETE FROM categories WHERE id=?", (cat_id,))
-    def subcategories(self, category_id): return self.q("SELECT * FROM subcategories WHERE category_id=? ORDER BY name", (category_id,))
+            self.e(
+                "UPDATE categories SET name=?, tipo=? WHERE id=?",
+                (name, tipo, cat_id),
+            )
+            return cat_id
+        return self.e(
+            "INSERT INTO categories(company_id,name,tipo) VALUES(?,?,?)",
+            (company_id, name, tipo),
+        )
+
+    def category_delete(self, cat_id):
+        self.e("DELETE FROM categories WHERE id=?", (cat_id,))
+
+    def subcategories(self, category_id):
+        return self.q(
+            "SELECT * FROM subcategories WHERE category_id=? ORDER BY name",
+            (category_id,),
+        )
+
     def subcategory_save(self, category_id, name, sub_id=None):
         if sub_id:
-            self.e("UPDATE subcategories SET name=?, category_id=? WHERE id=?", (name, category_id, sub_id)); return sub_id
-        return self.e("INSERT INTO subcategories(category_id,name) VALUES(?,?)", (category_id, name))
-    def subcategory_delete(self, sub_id): self.e("DELETE FROM subcategories WHERE id=?", (sub_id,))
+            self.e(
+                "UPDATE subcategories SET name=?, category_id=? WHERE id=?",
+                (name, category_id, sub_id),
+            )
+            return sub_id
+        return self.e(
+            "INSERT INTO subcategories(category_id,name) VALUES(?,?)",
+            (category_id, name),
+        )
 
-    # Transactions & Payments
+    def subcategory_delete(self, sub_id):
+        self.e("DELETE FROM subcategories WHERE id=?", (sub_id,))
+
+    # ---------------------- TRANSACTIONS / PAYMENTS ----------------------
     def transactions(self, company_id, tipo=None):
-        base = """SELECT t.*, IFNULL((SELECT SUM(p.amount+p.interest-p.discount) FROM payments p WHERE p.transaction_id=t.id),0) AS pago
-                  FROM transactions t WHERE t.company_id=?"""
-        params=[company_id]
-        if tipo: base += " AND t.tipo=?"; params.append(tipo)
+        base = """
+            SELECT t.*,
+                   IFNULL((SELECT SUM(p.amount + p.interest - p.discount)
+                             FROM payments p
+                            WHERE p.transaction_id=t.id), 0) AS pago
+              FROM transactions t
+             WHERE t.company_id=?
+        """
+        params = [company_id]
+        if tipo:
+            base += " AND t.tipo=?"
+            params.append(tipo)
         base += " ORDER BY date(data_venc)"
         return self.q(base, tuple(params))
+
     def transaction_save(self, rec, tx_id=None):
         if tx_id:
-            sql = """UPDATE transactions SET tipo=?, entity_id=?, category_id=?, subcategory_id=?, descricao=?, data_lanc=?, data_venc=?,
-                     forma_pagto=?, parcelas_qtd=?, valor=?, banco_id_padrao=?, updated_at=datetime('now') WHERE id=?"""
-            self.e(sql, (rec["tipo"], rec["entity_id"], rec["category_id"], rec["subcategory_id"], rec["descricao"],
-                         rec["data_lanc"], rec["data_venc"], rec["forma_pagto"], int(rec["parcelas_qtd"]),
-                         float(rec["valor"]), rec["banco_id_padrao"], tx_id))
+            sql = """
+                UPDATE transactions
+                   SET tipo=?, entity_id=?, category_id=?, subcategory_id=?, descricao=?,
+                       data_lanc=?, data_venc=?, forma_pagto=?, parcelas_qtd=?, valor=?,
+                       banco_id_padrao=?, updated_at=datetime('now')
+                 WHERE id=?
+            """
+            self.e(
+                sql,
+                (
+                    rec["tipo"],
+                    rec["entity_id"],
+                    rec["category_id"],
+                    rec["subcategory_id"],
+                    rec["descricao"],
+                    rec["data_lanc"],
+                    rec["data_venc"],
+                    rec["forma_pagto"],
+                    int(rec["parcelas_qtd"]),
+                    float(rec["valor"]),
+                    rec["banco_id_padrao"],
+                    tx_id,
+                ),
+            )
             return tx_id
-        sql = """INSERT INTO transactions(company_id,tipo,entity_id,category_id,subcategory_id,descricao,data_lanc,data_venc,
-                                          forma_pagto,parcelas_qtd,valor,status,banco_id_padrao,created_by)
-                 VALUES(?,?,?,?,?,?,?,?,?,?,?,'EM_ABERTO',?,?)"""
-        return self.e(sql, (rec["company_id"], rec["tipo"], rec["entity_id"], rec["category_id"], rec["subcategory_id"],
-                            rec["descricao"], rec["data_lanc"], rec["data_venc"], rec["forma_pagto"],
-                            int(rec["parcelas_qtd"]), float(rec["valor"]), rec["banco_id_padrao"], rec["created_by"]))
-    def transaction_delete(self, tx_id): self.e("DELETE FROM transactions WHERE id=?", (tx_id,))
-    def payments_for(self, tx_id):
-        sql = """SELECT p.*, b.bank_name||' - '||IFNULL(b.account_name,'') AS banco
-                 FROM payments p JOIN bank_accounts b ON b.id=p.bank_id
-                 WHERE p.transaction_id=? ORDER BY date(p.payment_date)"""
-        return self.q(sql, (tx_id,))
-    def payment_add(self, rec):
-        sql = """INSERT INTO payments(transaction_id,company_id,payment_date,bank_id,amount,interest,discount,doc_ref,created_by)
-                 VALUES(?,?,?,?,?,?,?,?,?)"""
-        return self.e(sql, (rec["transaction_id"], rec["company_id"], rec["payment_date"], rec["bank_id"],
-                            float(rec["amount"]), float(rec["interest"]), float(rec["discount"]),
-                            rec["doc_ref"], rec["created_by"]))
-    def payment_delete(self, payment_id): self.e("DELETE FROM payments WHERE id=?", (payment_id,))
 
-    # DRE / dashboard
-    def dre(self, company_id, ano, mes=None, regime='COMPETENCIA'):
-        src = "vw_dre_competencia" if regime == 'COMPETENCIA' else "vw_dre_caixa"
-        params=[company_id, str(ano)]; filt=""
-        if mes: filt=" AND mes=? "; params.append(f"{int(mes):02d}")
-        sql=f"""SELECT c.name AS categoria, v.tipo, v.total
-                FROM {src} v JOIN categories c ON c.id=v.category_id
-                WHERE v.company_id=? AND v.ano=? {filt}
-                ORDER BY v.tipo, c.name"""
+        sql = """
+            INSERT INTO transactions
+                (company_id, tipo, entity_id, category_id, subcategory_id, descricao,
+                 data_lanc, data_venc, forma_pagto, parcelas_qtd, valor, status,
+                 banco_id_padrao, created_by)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,'EM_ABERTO',?,?)
+        """
+        return self.e(
+            sql,
+            (
+                rec["company_id"],
+                rec["tipo"],
+                rec["entity_id"],
+                rec["category_id"],
+                rec["subcategory_id"],
+                rec["descricao"],
+                rec["data_lanc"],
+                rec["data_venc"],
+                rec["forma_pagto"],
+                int(rec["parcelas_qtd"]),
+                float(rec["valor"]),
+                rec["banco_id_padrao"],
+                rec["created_by"],
+            ),
+        )
+
+    def transaction_delete(self, tx_id):
+        self.e("DELETE FROM transactions WHERE id=?", (tx_id,))
+
+    def payments_for(self, tx_id):
+        sql = """
+            SELECT p.*, b.bank_name||' - '||IFNULL(b.account_name,'') AS banco
+              FROM payments p
+              JOIN bank_accounts b ON b.id = p.bank_id
+             WHERE p.transaction_id=?
+             ORDER BY date(p.payment_date)
+        """
+        return self.q(sql, (tx_id,))
+
+    def payment_add(self, rec):
+        sql = """
+            INSERT INTO payments
+                (transaction_id, company_id, payment_date, bank_id, amount, interest, discount, doc_ref, created_by)
+            VALUES (?,?,?,?,?,?,?,?,?)
+        """
+        return self.e(
+            sql,
+            (
+                rec["transaction_id"],
+                rec["company_id"],
+                rec["payment_date"],
+                rec["bank_id"],
+                float(rec["amount"]),
+                float(rec["interest"]),
+                float(rec["discount"]),
+                rec["doc_ref"],
+                rec["created_by"],
+            ),
+        )
+
+    def payment_delete(self, payment_id):
+        self.e("DELETE FROM payments WHERE id=?", (payment_id,))
+
+    # ---------------------- DRE / DASHBOARD ----------------------
+    def dre(self, company_id, ano, mes=None, regime="COMPETENCIA"):
+        src = "vw_dre_competencia" if regime == "COMPETENCIA" else "vw_dre_caixa"
+        params = [company_id, str(ano)]
+        filt = ""
+        if mes:
+            filt = " AND mes=? "
+            params.append(f"{int(mes):02d}")
+        sql = f"""
+            SELECT c.name AS categoria, v.tipo, v.total
+              FROM {src} v
+              JOIN categories c ON c.id = v.category_id
+             WHERE v.company_id = ? AND v.ano = ? {filt}
+             ORDER BY v.tipo, c.name
+        """
         return self.q(sql, tuple(params))
+
     def resumo_periodo(self, company_id, dt_ini: str, dt_fim_excl: str):
         sql = """
-            SELECT t.tipo, ROUND(SUM(t.valor - IFNULL((SELECT SUM(p.amount+p.interest-p.discount)
-                        FROM payments p WHERE p.transaction_id=t.id),0)),2) AS saldo
-            FROM transactions t
-            WHERE t.company_id=? AND date(t.data_venc)>=date(?) AND date(t.data_venc)<date(?)
-              AND t.status <> 'CANCELADO'
-            GROUP BY t.tipo
+            SELECT t.tipo,
+                   ROUND(SUM(t.valor - IFNULL((
+                       SELECT SUM(p.amount + p.interest - p.discount)
+                         FROM payments p
+                        WHERE p.transaction_id=t.id
+                   ),0)), 2) AS saldo
+              FROM transactions t
+             WHERE t.company_id=? 
+               AND date(t.data_venc) >= date(?) 
+               AND date(t.data_venc) <  date(?)
+               AND t.status <> 'CANCELADO'
+          GROUP BY t.tipo
         """
         rows = self.q(sql, (company_id, dt_ini, dt_fim_excl))
-        res = {'PAGAR': 0.0, 'RECEBER': 0.0}
-        for r in rows: res[r['tipo']] = max(0.0, float(r['saldo'] or 0))
+        res = {"PAGAR": 0.0, "RECEBER": 0.0}
+        for r in rows:
+            res[r["tipo"]] = max(0.0, float(r["saldo"] or 0.0))
         return res
 
-# =============================================================================
-# Exportações
-# =============================================================================
-def table_to_html(table: QTableWidget, title: str) -> str:
-    head = "<tr>" + "".join(f"<th>{table.horizontalHeaderItem(c).text()}</th>" for c in range(table.columnCount())) + "</tr>"
+    def dre_retencoes_por_sub(self, company_id: int, ano: int, mes: int | None, regime: str = "COMPETENCIA"):
+        """Retorna dict {'COFINS': v, 'CSLL': v, 'IRPJ': v, 'PIS': v} conforme período/regime."""
+        alvo_subs = ("COFINS", "CSLL", "IRPJ", "PIS")
+        ret = {k: 0.0 for k in alvo_subs}
+
+        if regime == "COMPETENCIA":
+            sql = """
+                SELECT s.name AS sub, ROUND(SUM(t.valor), 2) AS total
+                  FROM transactions t
+                  JOIN categories c   ON c.id = t.category_id
+                  JOIN subcategories s ON s.id = t.subcategory_id
+                 WHERE t.company_id = ?
+                   AND t.tipo = 'PAGAR'
+                   AND c.name = 'DESPESAS COM IMPOSTOS'
+                   AND t.status <> 'CANCELADO'
+                   AND strftime('%Y', t.data_lanc) = ?
+                   AND (? IS NULL OR strftime('%m', t.data_lanc) = ?)
+                   AND s.name IN ('COFINS','CSLL','IRPJ','PIS')
+              GROUP BY s.name
+            """
+            mes_str = f"{int(mes):02d}" if mes else None
+            rows = self.q(sql, (company_id, str(ano), mes_str, mes_str))
+        else:  # CAIXA
+            sql = """
+                SELECT s.name AS sub,
+                       ROUND(SUM(p.amount + p.interest - p.discount), 2) AS total
+                  FROM payments p
+                  JOIN transactions t ON t.id = p.transaction_id
+                  JOIN categories   c ON c.id = t.category_id
+                  JOIN subcategories s ON s.id = t.subcategory_id
+                 WHERE p.company_id = ?
+                   AND t.tipo = 'PAGAR'
+                   AND c.name = 'DESPESAS COM IMPOSTOS'
+                   AND strftime('%Y', p.payment_date) = ?
+                   AND (? IS NULL OR strftime('%m', p.payment_date) = ?)
+                   AND s.name IN ('COFINS','CSLL','IRPJ','PIS')
+              GROUP BY s.name
+            """
+            mes_str = f"{int(mes):02d}" if mes else None
+            rows = self.q(sql, (company_id, str(ano), mes_str, mes_str))
+
+        for r in rows:
+            if r["sub"] in ret:
+                ret[r["sub"]] = float(r["total"] or 0.0)
+        return ret
+def table_to_html(table, title: str) -> str:
+    head = "<tr>" + "".join(
+        f"<th>{table.horizontalHeaderItem(c).text()}</th>"
+        for c in range(table.columnCount())
+    ) + "</tr>"
     rows = []
     for r in range(table.rowCount()):
         tds = []
         for c in range(table.columnCount()):
-            it = table.item(r,c)
+            it = table.item(r, c)
             tds.append(f"<td>{'' if it is None else it.text()}</td>")
-        rows.append("<tr>"+"".join(tds)+"</tr>")
+        rows.append("<tr>" + "".join(tds) + "</tr>")
     style = """
-    <style>body{font-family:Arial,Helvetica,sans-serif;font-size:12px}
-    table{border-collapse:collapse;width:100%}
-    th,td{border:1px solid #888;padding:4px 6px}th{background:#eee}</style>
+    <style>
+      body{font-family:Arial,Helvetica,sans-serif;font-size:12px}
+      h2{margin:0 0 8px 0}
+      table{border-collapse:collapse;width:100%}
+      th,td{border:1px solid #888;padding:4px 6px}
+      th{background:#eee}
+    </style>
     """
     return f"<!doctype html><html><head>{style}</head><body><h2>{title}</h2><table>{head}{''.join(rows)}</table></body></html>"
 
-def export_pdf_from_table(parent, table: QTableWidget, title: str):
-    fn,_ = QFileDialog.getSaveFileName(parent,"Salvar PDF",f"{title}.pdf","PDF (*.pdf)")
-    if not fn: return
-    html = table_to_html(table, title)
-    doc = QTextDocument(); doc.setHtml(html)
-    pr = QPrinter(QPrinter.HighResolution); pr.setOutputFormat(QPrinter.PdfFormat)
-    if not fn.lower().endswith(".pdf"): fn += ".pdf"
-    pr.setOutputFileName(fn); doc.print_(pr)
-    msg_info(f"PDF gerado em:\n{fn}", parent)
-
-def export_excel_from_table(parent, table: QTableWidget, title: str):
-    try:
-        import xlsxwriter
-        fn,_ = QFileDialog.getSaveFileName(parent,"Salvar Excel",f"{title}.xlsx","Excel (*.xlsx)")
-        if not fn: return
-        if not fn.lower().endswith(".xlsx"): fn += ".xlsx"
-        wb = xlsxwriter.Workbook(fn); ws = wb.add_worksheet("Dados")
-        for c in range(table.columnCount()): ws.write(0,c,table.horizontalHeaderItem(c).text())
-        for r in range(table.rowCount()):
-            for c in range(table.columnCount()):
-                it = table.item(r,c); ws.write(r+1,c,"" if it is None else it.text())
-        wb.close(); msg_info(f"Planilha Excel gerada em:\n{fn}", parent)
-    except Exception:
-        fn,_ = QFileDialog.getSaveFileName(parent,"Salvar CSV",f"{title}.csv","CSV (*.csv)")
-        if not fn: return
-        if not fn.lower().endswith(".csv"): fn += ".csv"
-        with open(fn,"w",newline="",encoding="utf-8") as f:
-            wr=csv.writer(f, delimiter=';')
-            wr.writerow([table.horizontalHeaderItem(c).text() for c in range(table.columnCount())])
-            for r in range(table.rowCount()):
-                wr.writerow([(table.item(r,c).text() if table.item(r,c) else "") for c in range(table.columnCount())])
-        msg_info(f"CSV gerado em:\n{fn}", parent)
-    
-# ===== [ADICIONE JUNTO DAS FUNÇÕES DE EXPORTAÇÃO] ============================
-def export_pdf_from_html(parent, html: str, title: str):
-    """Gera PDF quadrado (800x800) e usa quase toda a largura para o conteúdo."""
+def export_pdf_from_table(parent, table, title: str):
+    from PyQt5.QtWidgets import QFileDialog, QMessageBox
     fn, _ = QFileDialog.getSaveFileName(parent, "Salvar PDF", f"{title}.pdf", "PDF (*.pdf)")
     if not fn:
         return
     if not fn.lower().endswith(".pdf"):
         fn += ".pdf"
-
+    html = table_to_html(table, title)
+    doc = QTextDocument()
+    doc.setHtml(html)
     pr = QPrinter(QPrinter.HighResolution)
     pr.setOutputFormat(QPrinter.PdfFormat)
     pr.setOutputFileName(fn)
-
-    # Página quadrada 800 x 800 (pontos = px a 72dpi)
-    pr.setPaperSize(QSizeF(800, 800), QPrinter.Point)
-    pr.setFullPage(True)
-    # margens pequenas
-    pr.setPageMargins(10, 10, 10, 10, QPrinter.Point)
-
-    # largura útil = 800 - 2*10 = 780; vamos reservar um respiro para a borda da tabela
-    doc = QTextDocument()
-    doc.setPageSize(QSizeF(780, 780))
-    doc.setHtml(html)
     doc.print_(pr)
+    QMessageBox.information(parent, "ERP Financeiro", f"PDF gerado em:\n{fn}")
 
-    msg_info(f"PDF gerado em:\n{fn}", parent)
-
+def export_excel_from_table(parent, table, title: str):
+    from PyQt5.QtWidgets import QFileDialog, QMessageBox
+    try:
+        import xlsxwriter
+        fn, _ = QFileDialog.getSaveFileName(parent, "Salvar Excel", f"{title}.xlsx", "Excel (*.xlsx)")
+        if not fn:
+            return
+        if not fn.lower().endswith(".xlsx"):
+            fn += ".xlsx"
+        wb = xlsxwriter.Workbook(fn)
+        ws = wb.add_worksheet("Dados")
+        # cabeçalho
+        for c in range(table.columnCount()):
+            ws.write(0, c, table.horizontalHeaderItem(c).text())
+        # linhas
+        for r in range(table.rowCount()):
+            for c in range(table.columnCount()):
+                it = table.item(r, c)
+                ws.write(r + 1, c, "" if it is None else it.text())
+        wb.close()
+        QMessageBox.information(parent, "ERP Financeiro", f"Planilha Excel gerada em:\n{fn}")
+    except Exception:
+        # fallback CSV
+        fn, _ = QFileDialog.getSaveFileName(parent, "Salvar CSV", f"{title}.csv", "CSV (*.csv)")
+        if not fn:
+            return
+        if not fn.lower().endswith(".csv"):
+            fn += ".csv"
+        with open(fn, "w", newline="", encoding="utf-8") as f:
+            wr = csv.writer(f, delimiter=';')
+            wr.writerow([table.horizontalHeaderItem(c).text() for c in range(table.columnCount())])
+            for r in range(table.rowCount()):
+                wr.writerow([(table.item(r, c).text() if table.item(r, c) else "") for c in range(table.columnCount())])
+        QMessageBox.information(parent, "ERP Financeiro", f"CSV gerado em:\n{fn}")
 # =============================================================================
 # Diálogos base
 # =============================================================================
@@ -1736,192 +2130,198 @@ class CashflowDialog(QDialog):
 
 # ===== [SUBSTITUA A CLASSE DREDialog INTEIRA POR ESTA] ======================
 class DREDialog(QDialog):
-    """
-    DRE com layout do print:
-    - Tela elástica (acompanha o tamanho da janela).
-    - PDF ocupa 100% da largura útil.
-    - Exportar Excel/CSV reativado.
-    """
     def __init__(self, db: DB, company_id: int, parent=None):
-        super().__init__(parent)
-        self.db = db
-        self.company_id = company_id
+        super().__init__(parent); self.db=db; self.company_id=company_id
         self.setWindowTitle("Demonstração de Resultado (DRE)")
 
-        self._last_rows = []
-
-        # Filtros
-        self.spAno = QSpinBox();  self.spAno.setRange(2000, 2099); self.spAno.setValue(date.today().year)
-        self.spMes = QSpinBox();  self.spMes.setRange(0, 12);      self.spMes.setValue(0)   # 0 = todos
-        self.cbReg = QComboBox(); self.cbReg.addItems(["COMPETENCIA", "CAIXA"])
+        self.spAno=QSpinBox(); self.spAno.setRange(2000,2099); self.spAno.setValue(date.today().year)
+        self.spMes=QSpinBox(); self.spMes.setRange(0,12); self.spMes.setValue(0)
+        self.cbReg=QComboBox(); self.cbReg.addItems(["COMPETENCIA","CAIXA"])
 
         btGerar = QPushButton("Gerar"); btGerar.setIcon(std_icon(self, self.style().SP_BrowserReload))
-        btGerar.clicked.connect(self.load)
+        btGerar.clicked.connect(self.gerar)
 
         btPdf = QPushButton("Exportar PDF"); btPdf.setIcon(std_icon(self, self.style().SP_DriveDVDIcon))
         btPdf.clicked.connect(self.export_pdf)
 
-        btXls = QPushButton("Exportar Excel/CSV"); btXls.setIcon(std_icon(self, self.style().SP_DialogSaveButton))
-        btXls.clicked.connect(self.export_excel)
-
-        # Visualização (somente leitura)
-        self.view = QTextEdit(); self.view.setReadOnly(True)
-        self.view.setStyleSheet("QTextEdit{background:#ffffff;}")
-
-        top = QHBoxLayout()
-        top.addWidget(QLabel("Ano:")); top.addWidget(self.spAno)
-        top.addSpacing(8)
-        top.addWidget(QLabel("Mês (0=todos):")); top.addWidget(self.spMes)
-        top.addSpacing(8)
-        top.addWidget(QLabel("Regime:")); top.addWidget(self.cbReg)
-        top.addSpacing(12)
-        top.addWidget(btGerar)
+        top=QHBoxLayout()
+        for w in [QLabel("Ano:"), self.spAno, QLabel("Mês (0=todos):"), self.spMes, QLabel("Regime:"), self.cbReg, btGerar]:
+            top.addWidget(w)
         top.addStretch()
 
-        lay = QVBoxLayout(self)
-        lay.addLayout(top)
-        lay.addWidget(self.view)
-        hl = QHBoxLayout(); hl.addWidget(btPdf); hl.addWidget(btXls); hl.addStretch(); lay.addLayout(hl)
+        # Visualização (HTML)
+        from PyQt5.QtWidgets import QTextEdit
+        self.view = QTextEdit()
+        self.view.setReadOnly(True)
+        self.view.setStyleSheet("QTextEdit{background:#ffffff;border:0;padding:0;}")
+
+        lay=QVBoxLayout(self); lay.addLayout(top); lay.addWidget(self.view)
+        hl=QHBoxLayout(); hl.addWidget(btPdf); hl.addStretch(); lay.addLayout(hl)
 
         enable_autosize(self, 0.85, 0.75, 1100, 650)
-        self.load()
+        self.gerar()
 
-    # ---------- largura elástica na tela ----------
-    def _content_width(self) -> int:
-        try:
-            w = self.view.viewport().width()
-        except Exception:
-            w = self.width()
-        return max(720, min(1200, w - 40))  # limites
+    # ------- helpers ----------
+    def _cab(self, txt):
+        # Cabeçalho do bloco: borda completa e centralizado
+        return (
+            '<tr>'
+            '<td colspan="2" '
+            'style="background:#ddd;text-align:center;font-weight:700;'
+            'padding:6px 4px;border:1px solid #333;border-bottom:2px solid #333;">'
+            f'{txt}'
+            '</td>'
+            '</tr>'
+            # Cabeçalho das colunas com larguras fixas
+            '<tr>'
+            '<td style="width:520px;background:#eee;font-weight:700;'
+            'padding:6px 8px;border:1px solid #333;border-bottom:1px solid #bdbdbd;'
+            'white-space:nowrap;">CATEGORIA</td>'
+            '<td style="width:200px;background:#eee;font-weight:700;'
+            'padding:6px 8px;border:1px solid #333;border-bottom:1px solid #bdbdbd;'
+            'text-align:right;white-space:nowrap;">VALOR</td>'
+            '</tr>'
+        )
 
-    # ---------- HTML (tela ou PDF) ----------
-    def _build_html(self, rows, width_px: int = None, for_pdf: bool = False) -> str:
-        rec_rows  = [r for r in rows if (r["tipo"] == "RECEBER")]
-        pag_rows  = [r for r in rows if (r["tipo"] == "PAGAR")]
+    def _linha(self, nome, valor, negativo=False, zebra=False):
+        vtxt = fmt_brl(abs(valor))
+        if negativo and valor != 0:
+            vtxt = "-" + vtxt
+        bg = "background:#f6f6f6;" if zebra else ""
+        td_left  = f'padding:6px 8px;border:1px solid #bdbdbd;{bg}white-space:nowrap;'
+        td_right = f'padding:6px 8px;border:1px solid #bdbdbd;{bg}text-align:right;white-space:nowrap;'
+        return (
+            "<tr>"
+            f'<td style="{td_left}">{nome}</td>'
+            f'<td style="{td_right}">{vtxt}</td>'
+            "</tr>"
+        )
 
-        total_receber = sum(float(r["total"] or 0) for r in rec_rows)
-        total_pagar   = sum(float(r["total"] or 0) for r in pag_rows)
-        retencoes     = 0.0  # placeholder
+    def _style(self):
+        # Sem CSS global: tudo inline (Qt respeita melhor)
+        return ""
 
-        margem = total_receber - retencoes - total_pagar
-        perc   = (margem / total_receber * 100.0) if total_receber else 0.0
-        perc_txt = f"{perc:,.1f}%".replace(".", ",")
-
-        def money(v): return fmt_brl(abs(v))
-
-        # largura da tabela
-        if for_pdf:
-            # para PDF queremos um valor em px (ex.: 760) pra caber nas margens de 800x800
-            width_px = width_px or 760
-            wrap_w = f"{width_px}px"
-            col_cat = f"{int(width_px*0.68)}px"
-            col_val = f"{int(width_px*0.32)}px"
-            base_font = "12px"
-        else:
-            width_px = width_px or 900
-            wrap_w = f"{width_px}px"
-            col_cat = f"{int(width_px*0.68)}px"
-            col_val = f"{int(width_px*0.32)}px"
-            base_font = "13px"
-
-        css = f"""
-        <style>
-        body{{font-family:Arial,Helvetica,sans-serif;}}
-        table.wrap{{width:{wrap_w}; margin:10px auto; border:3px solid #000; border-collapse:collapse;}}
-        .wrap th,.wrap td{{border:1px solid #000; padding:8px 10px; font-size:{base_font};}}
-        .sec{{background:#eee; font-weight:700; font-style:italic; text-align:center;}}
-        .head{{background:#ddd; font-weight:700;}}
-        .right{{text-align:right;}}
-        .center{{text-align:center;}}
-        .nowrap{{white-space:nowrap;}}
-        .col-cat{{width:{col_cat};}}
-        .col-val{{width:{col_val};}}
-        .total{{font-weight:700;}}
-        .percent{{font-weight:700; font-size:14px;}}
-        </style>
+    def gerar(self):
         """
-
-        html = [css, '<table class="wrap">']
-        # (resto do HTML exatamente como está na sua versão atual)
-        # -----------------------------------------------------------------
-        html += [
-            '<tr><th class="sec" colspan="2">CONTAS A RECEBER</th></tr>',
-            '<tr class="head"><th class="nowrap col-cat">CATEGORIA</th><th class="right nowrap col-val">VALOR</th></tr>'
-        ]
-        for r in rec_rows:
-            html.append(
-                f'<tr><td class="col-cat">{(r["categoria"] or "").upper()}</td>'
-                f'<td class="right col-val">{money(float(r["total"]))}</td></tr>'
-            )
-        html += [
-            '<tr class="sec"><th colspan="2">RETENÇÕES DE IMPOSTOS</th></tr>',
-            '<tr><td class="col-cat">IMPOSTO RETIDO</td><td class="right col-val">&nbsp;</td></tr>'
-        ]
-        html += [
-            '<tr class="sec"><th colspan="2">CONTAS A PAGAR</th></tr>',
-            '<tr class="head"><th class="nowrap col-cat">CATEGORIA</th><th class="right nowrap col-val">VALOR</th></tr>'
-        ]
-        for r in pag_rows:
-            val = float(r["total"])
-            html.append(
-                f'<tr><td class="col-cat">{(r["categoria"] or "").upper()}</td>'
-                f'<td class="right col-val">-{money(val)}</td></tr>'
-            )
-        html += [
-            '<tr class="sec"><th colspan="2">MARGEM LIQUIDA</th></tr>',
-            f'<tr class="total"><td class="col-cat"></td><td class="right col-val">{fmt_brl(margem)}</td></tr>',
-            f'<tr><td class="center percent" colspan="2">{perc_txt}</td></tr>',
-            '</table>'
-        ]
-        return "\n".join(html)
-
-    def load(self):
+        Monta o HTML do DRE.
+        - Abre a <table> com <colgroup> para 2 colunas de largura fixa.
+        - 'Margem Líquida' sem colspan (preserva a divisória central) e com bordas.
+        """
+        ano = self.spAno.value()
         mes = self.spMes.value() or None
-        rows = self.db.dre(self.company_id, self.spAno.value(), mes, self.cbReg.currentText())
-        self._last_rows = rows[:]
-        html = self._build_html(rows, self._content_width(), for_pdf=False)
-        self.view.setHtml(html)
+        reg = self.cbReg.currentText()
+
+        # Totais por categoria
+        rows = self.db.dre(self.company_id, ano, mes, reg)
+        rec_rows = [r for r in rows if r["tipo"] == "RECEBER"]
+        pag_rows = [
+            r for r in rows
+            if r["tipo"] == "PAGAR" and (r["categoria"] or "").upper() != "DESPESAS COM IMPOSTOS"
+        ]
+
+        # Retenções detalhadas
+        ret_map = self.db.dre_retencoes_por_sub(self.company_id, ano, mes, reg)
+        total_ret = sum(ret_map.values())
+
+        # ===== HTML =====
+        html = ["<!doctype html><html><head>", self._style(), "</head><body>"]
+
+        # Tabela central com 2 colunas
+        html.append(
+            '<table class="box" cellpadding="0" cellspacing="0">'
+            '<colgroup><col><col></colgroup>'
+        )
+
+        # --- CONTAS A RECEBER ---
+        html.append(self._cab("CONTAS A RECEBER"))
+        z = False
+        rec_total = 0.0
+        for r in rec_rows:
+            v = float(r["total"] or 0.0)
+            rec_total += v
+            html.append(self._linha(r["categoria"], v, negativo=False, zebra=z))
+            z = not z
+
+        html.append('<tr class="sep"><td colspan="2"></td></tr>')
+
+        # --- RETENÇÕES DE IMPOSTOS ---
+        html.append(self._cab("RETENÇÕES DE IMPOSTOS"))
+        z = False
+        for nome in ("COFINS", "CSLL", "IRPJ", "PIS"):
+            html.append(self._linha(nome, ret_map.get(nome, 0.0), negativo=True, zebra=z))
+            z = not z
+
+        html.append('<tr class="sep"><td colspan="2"></td></tr>')
+
+        # --- CONTAS A PAGAR (sem impostos) ---
+        html.append(self._cab("CONTAS A PAGAR"))
+        z = False
+        pag_total = 0.0
+        for r in pag_rows:
+            v = float(r["total"] or 0.0)
+            pag_total += v
+            html.append(self._linha(r["categoria"], v, negativo=True, zebra=z))
+            z = not z
+
+        # --- MARGEM LÍQUIDA (box com bordas fechadas) ---
+        margem = rec_total - total_ret - pag_total
+        perc = (margem / rec_total * 100.0) if rec_total else 0.0
+        perc_txt = f"{perc:,.1f}%".replace(",", "X").replace(".", ",").replace("X", ".")
+
+        # separador mantendo laterais
+        html.append(
+            '<tr>'
+            '<td style="height:10px;border-left:1px solid #bdbdbd;border-right:1px solid #bdbdbd;"></td>'
+            '<td style="height:10px;border-left:1px solid #bdbdbd;border-right:1px solid #bdbdbd;"></td>'
+            '</tr>'
+        )
+
+        # cabeçalho do bloco
+        html.append(
+            '<tr><td colspan="2" '
+            'style="background:#ddd;text-align:center;font-weight:700;'
+            'padding:6px 4px;border:1px solid #333;border-bottom:2px solid #333;">'
+            'MARGEM LÍQUIDA'
+            '</td></tr>'
+        )
+
+        # linha do valor (sem colspan — mantém a divisória central)
+        html.append(
+            '<tr>'
+            '<td style="padding:6px 8px;border:1px solid #bdbdbd;white-space:nowrap;"></td>'
+            f'<td style="padding:6px 8px;border:1px solid #bdbdbd;'
+            f'text-align:right;font-weight:700;white-space:nowrap;">{fmt_brl(margem)}</td>'
+            '</tr>'
+        )
+
+        # linha do percentual (também sem colspan)
+        html.append(
+            '<tr>'
+            '<td style="padding:6px 8px;border:1px solid #bdbdbd;white-space:nowrap;"></td>'
+            f'<td style="padding:6px 8px;border:1px solid #bdbdbd;'
+            f'text-align:right;white-space:nowrap;">{perc_txt}</td>'
+            '</tr>'
+        )
+
+        html.append("</table></body></html>")
+        self.view.setHtml("".join(html))
 
     def export_pdf(self):
-        rows = self._last_rows[:] if self._last_rows else []
-        html = self._build_html(rows, for_pdf=True)  # largura 100% para PDF
-        export_pdf_from_html(self, html, "DRE")
-
-    def export_excel(self):
-        """Gera uma folha simples: Categoria | Tipo | Valor (+ totais)."""
-        rows = self._last_rows[:] if self._last_rows else []
-        tmp = QTableWidget(0, 3)
-        tmp.setHorizontalHeaderLabels(["Categoria", "Tipo", "Valor"])
-        rec = 0.0; pag = 0.0
-        for r in rows:
-            row = tmp.rowCount(); tmp.insertRow(row)
-            val = float(r["total"] or 0)
-            tmp.setItem(row, 0, QTableWidgetItem(str(r["categoria"] or "")))
-            tmp.setItem(row, 1, QTableWidgetItem("RECEBER" if r["tipo"] == "RECEBER" else "PAGAR"))
-            tmp.setItem(row, 2, QTableWidgetItem(fmt_brl(val if r["tipo"] == "RECEBER" else -val)))
-            if r["tipo"] == "RECEBER": rec += val
-            else: pag += val
-
-        # separador + totais
-        if rows:
-            tmp.insertRow(tmp.rowCount())
-            row = tmp.rowCount(); tmp.insertRow(row)
-            tmp.setItem(row, 0, QTableWidgetItem("TOTAL RECEBER"))
-            tmp.setItem(row, 2, QTableWidgetItem(fmt_brl(rec)))
-            row = tmp.rowCount(); tmp.insertRow(row)
-            tmp.setItem(row, 0, QTableWidgetItem("TOTAL PAGAR"))
-            tmp.setItem(row, 2, QTableWidgetItem(fmt_brl(-pag)))
-            margem = rec - pag
-            row = tmp.rowCount(); tmp.insertRow(row)
-            tmp.setItem(row, 0, QTableWidgetItem("MARGEM LÍQUIDA"))
-            tmp.setItem(row, 2, QTableWidgetItem(fmt_brl(margem)))
-
-        export_excel_from_table(self, tmp, "DRE")
-
-    def resizeEvent(self, e):
-        super().resizeEvent(e)
-        if self._last_rows:
-            self.view.setHtml(self._build_html(self._last_rows, self._content_width(), for_pdf=False))
+        # Gera PDF 800x800
+        fn,_ = QFileDialog.getSaveFileName(self, "Salvar PDF", "DRE.pdf", "PDF (*.pdf)")
+        if not fn:
+            return
+        if not fn.lower().endswith(".pdf"):
+            fn += ".pdf"
+        doc_html = self.view.toHtml()
+        doc = QTextDocument()
+        doc.setHtml(doc_html)
+        pr = QPrinter(QPrinter.HighResolution)
+        pr.setOutputFormat(QPrinter.PdfFormat)
+        pr.setPageSizeMM(QSizeF(211.67, 211.67))  # ~800x800 px a 96 dpi (aprox)
+        pr.setOutputFileName(fn)
+        doc.print_(pr)
+        msg_info(f"PDF gerado em:\n{fn}", self)
 
 # =============================================================================
 # Login + Main (dashboard)
