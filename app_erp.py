@@ -161,6 +161,21 @@ class MaskDelegate(QStyledItemDelegate):
         text = editor.text().upper() if self.uppercase else editor.text()
         model.setData(index, text)
 
+class AccountTypeDelegate(QStyledItemDelegate):
+    def createEditor(self, parent, option, index):
+        cb = QComboBox(parent)
+        cb.addItems(["CORRENTE", "POUPANÇA"])
+        return cb
+
+    def setEditorData(self, editor, index):
+        val = (index.data() or "").upper()
+        if val not in ("CORRENTE", "POUPANÇA"):
+            val = "CORRENTE"
+        editor.setCurrentText(val)
+
+    def setModelData(self, editor, model, index):
+        model.setData(index, editor.currentText())
+
 class DocNumberDelegate(QStyledItemDelegate):
     def createEditor(self, parent, option, index):
         ed = QLineEdit(parent)
@@ -1368,57 +1383,125 @@ class UsersDialog(QDialog):
 
 class BanksDialog(QDialog):
     def __init__(self, db: DB, company_id: int, parent=None):
-        super().__init__(parent); self.db=db; self.company_id=company_id
+        super().__init__(parent)
+        self.db = db
+        self.company_id = company_id
         self.setWindowTitle("Cadastro de Bancos / Contas")
-        self.table=QTableWidget(0,10)
-        self.table.setHorizontalHeaderLabels(["ID","Banco","Nome da Conta","Tipo","Agência","Conta","Saldo Inicial","Saldo Atual","Ativo","Criado em"])
-        stretch_table(self.table); zebra_table(self.table)
+
+        # Agora são 9 colunas (sem 'Nome da Conta')
+        self.table = QTableWidget(0, 9)
+        self.table.setHorizontalHeaderLabels([
+            "ID", "Banco", "Tipo", "Agência", "Conta",
+            "Saldo Inicial", "Saldo Atual", "Ativo", "Criado em"
+        ])
+        stretch_table(self.table)
+        zebra_table(self.table)
         self.table.setColumnHidden(0, True)
-        btAdd=QPushButton("Novo"); btSave=QPushButton("Salvar"); btDel=QPushButton("Excluir"); btReload=QPushButton("Recarregar")
-        for b,ic in ((btAdd,self.style().SP_FileDialogNewFolder),(btSave,self.style().SP_DialogSaveButton),
-                     (btDel,self.style().SP_TrashIcon),(btReload,self.style().SP_BrowserReload)):
+
+        # 'Tipo' com opções fixas
+        self.table.setItemDelegateForColumn(2, AccountTypeDelegate(self))
+
+        # Botões
+        btAdd  = QPushButton("Novo")
+        btSave = QPushButton("Salvar")
+        btDel  = QPushButton("Excluir")
+        btReload = QPushButton("Recarregar")
+        for b, ic in (
+            (btAdd, self.style().SP_FileDialogNewFolder),
+            (btSave, self.style().SP_DialogSaveButton),
+            (btDel, self.style().SP_TrashIcon),
+            (btReload, self.style().SP_BrowserReload),
+        ):
             b.setIcon(std_icon(self, ic))
-        btAdd.clicked.connect(self.add); btSave.clicked.connect(self.save); btDel.clicked.connect(self.delete); btReload.clicked.connect(self.load)
-        lay=QVBoxLayout(self); lay.addWidget(self.table); hl=QHBoxLayout(); [hl.addWidget(b) for b in (btAdd,btSave,btDel,btReload)]; lay.addLayout(hl)
-        self.load(); enable_autosize(self, 0.7, 0.55, 900, 520)
+        btAdd.clicked.connect(self.add)
+        btSave.clicked.connect(self.save)
+        btDel.clicked.connect(self.delete)
+        btReload.clicked.connect(self.load)
+
+        lay = QVBoxLayout(self)
+        lay.addWidget(self.table)
+        hl = QHBoxLayout()
+        [hl.addWidget(b) for b in (btAdd, btSave, btDel, btReload)]
+        lay.addLayout(hl)
+
+        self.load()
+        enable_autosize(self, 0.7, 0.55, 900, 520)
+
     def load(self):
-        rows=self.db.banks(self.company_id); self.table.setRowCount(0)
+        rows = self.db.banks(self.company_id)
+        self.table.setRowCount(0)
         for r in rows:
-            row=self.table.rowCount(); self.table.insertRow(row)
-            data=[r["id"], r["bank_name"], r["account_name"], r["account_type"], r["agency"], r["account_number"],
-                  fmt_brl(r["initial_balance"]), fmt_brl(r["current_balance"]), r["active"], iso_to_br(str(r["created_at"])[:10])]
-            for c,val in enumerate(data):
-                it=QTableWidgetItem("" if val is None else str(val))
-                if c in (0,9): it.setFlags(it.flags() & ~Qt.ItemIsEditable)
-                self.table.setItem(row,c,it)
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            # Sem 'account_name'; 'Tipo' é account_type
+            data = [
+                r["id"],
+                r["bank_name"],
+                (r["account_type"] or "CORRENTE"),
+                r["agency"],
+                r["account_number"],
+                fmt_brl(r["initial_balance"]),
+                fmt_brl(r["current_balance"]),
+                r["active"],
+                iso_to_br(str(r["created_at"])[:10]),
+            ]
+            for c, val in enumerate(data):
+                it = QTableWidgetItem("" if val is None else str(val))
+                # Tornar não editáveis: ID, Saldo Atual, Criado em
+                if c in (0, 6, 8):
+                    it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+                self.table.setItem(row, c, it)
+
     def add(self):
-        r=self.table.rowCount(); self.table.insertRow(r); self.table.setItem(r,0,QTableWidgetItem(""))
-        self.table.setItem(r,8,QTableWidgetItem("1"))
+        r = self.table.rowCount()
+        self.table.insertRow(r)
+        self.table.setItem(r, 0, QTableWidgetItem(""))                    # ID vazio
+        self.table.setItem(r, 2, QTableWidgetItem("CORRENTE"))            # Tipo padrão
+        self.table.setItem(r, 6, QTableWidgetItem(fmt_brl(0)))            # Saldo Atual (read-only)
+        self.table.setItem(r, 7, QTableWidgetItem("1"))                   # Ativo=1
+
+        # Bloqueia edição das colunas travadas da nova linha também
+        for c in (6, 8):
+            it = self.table.item(r, c)
+            if it:
+                it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+
     def save(self):
         for r in range(self.table.rowCount()):
-            id_txt=self.table.item(r,0).text() if self.table.item(r,0) else ""
-            rec=dict(
-                bank_name=self.table.item(r,1).text() if self.table.item(r,1) else "",
-                account_name=self.table.item(r,2).text() if self.table.item(r,2) else "",
-                account_type=self.table.item(r,3).text() if self.table.item(r,3) else "",
-                agency=self.table.item(r,4).text() if self.table.item(r,4) else "",
-                account_number=self.table.item(r,5).text() if self.table.item(r,5) else "",
-                initial_balance=parse_brl(self.table.item(r,6).text() if self.table.item(r,6) else "0"),
-                current_balance=parse_brl(self.table.item(r,7).text() if self.table.item(r,7) else "0"),
-                active=1 if (self.table.item(r,8) and self.table.item(r,8).text() not in ("0","False","false")) else 0
+            id_txt = self.table.item(r, 0).text() if self.table.item(r, 0) else ""
+            rec = dict(
+                bank_name     = self.table.item(r, 1).text() if self.table.item(r, 1) else "",
+                account_name  = "",  # removido da UI; mantemos vazio para o método bank_save
+                account_type  = (self.table.item(r, 2).text() if self.table.item(r, 2) else "CORRENTE").upper(),
+                agency        = self.table.item(r, 3).text() if self.table.item(r, 3) else "",
+                account_number= self.table.item(r, 4).text() if self.table.item(r, 4) else "",
+                initial_balance = parse_brl(self.table.item(r, 5).text() if self.table.item(r, 5) else "0"),
+                current_balance = parse_brl(self.table.item(r, 6).text() if self.table.item(r, 6) else "0"),
+                active        = 1 if (self.table.item(r, 7) and self.table.item(r, 7).text() not in ("0","False","false")) else 0,
             )
-            bid=int(id_txt) if id_txt.strip().isdigit() else None
-            bid=self.db.bank_save(self.company_id, rec, bid)
-            self.table.setItem(r,0,QTableWidgetItem(str(bid)))
-        msg_info("Bancos salvos."); self.load()
+
+            bid = int(id_txt) if id_txt.strip().isdigit() else None
+            bid = self.db.bank_save(self.company_id, rec, bid)
+            self.table.setItem(r, 0, QTableWidgetItem(str(bid)))
+
+        msg_info("Bancos salvos.")
+        self.load()
+
     def delete(self):
-        r=self.table.currentRow()
-        if r<0: return
-        id_txt=self.table.item(r,0).text() if self.table.item(r,0) else ""
-        if not id_txt.strip().isdigit(): self.table.removeRow(r); return
-        if not msg_yesno("Excluir esta conta bancária?"): return
-        try: self.db.bank_delete(int(id_txt))
-        except sqlite3.IntegrityError as e: msg_err(f"Não foi possível excluir. Conta vinculada a pagamentos.\n{e}"); return
+        r = self.table.currentRow()
+        if r < 0:
+            return
+        id_txt = self.table.item(r, 0).text() if self.table.item(r, 0) else ""
+        if not id_txt.strip().isdigit():
+            self.table.removeRow(r)
+            return
+        if not msg_yesno("Excluir esta conta bancária?"):
+            return
+        try:
+            self.db.bank_delete(int(id_txt))
+        except sqlite3.IntegrityError as e:
+            msg_err(f"Não foi possível excluir. Conta vinculada a pagamentos.\n{e}")
+            return
         self.load()
 
 class EntitiesDialog(QDialog):
@@ -2718,6 +2801,22 @@ class DREDialog(QDialog):
         pr.setOutputFileName(fn)
         doc.print_(pr)
         msg_info(f"PDF gerado em:\n{fn}", self)
+# =============================================================================
+# NfeDialog
+# =============================================================================
+class NfeDialog(QDialog):
+    def __init__(self, db: DB, company_id: int, parent=None):
+        super().__init__(parent)
+        self.db = db
+        self.company_id = company_id
+        self.setWindowTitle("Emissão NFS-e (NFE)")
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel("Módulo de NFS-e — em desenvolvimento."))
+        bt = QPushButton("Fechar")
+        bt.clicked.connect(self.close)
+        hl = QHBoxLayout(); hl.addStretch(1); hl.addWidget(bt)
+        lay.addLayout(hl)
+        enable_autosize(self, 0.4, 0.3, 480, 260)
 
 # =============================================================================
 # Login + Main (dashboard)
@@ -2873,6 +2972,12 @@ class MainWindow(QMainWindow):
             mMov = menubar.addMenu("Movimentação")
             for a in mov_actions: mMov.addAction(a)
 
+        # >>> Botão ao lado de Movimentação: Emissão NFS-e (NFE)
+        if self.has("NFE"):
+            actNfeTop = QAction("Emissão NFS-e (NFE)", self)
+            actNfeTop.triggered.connect(self.open_nfe)
+            menubar.addAction(actNfeTop)
+
         # ===== Relatórios
         rel_actions = []
         actFluxo = QAction("Fluxo de Caixa", self); actFluxo.triggered.connect(self.open_cashflow)
@@ -2970,6 +3075,11 @@ class MainWindow(QMainWindow):
         dlg.exec_()
         # garante atualização ao fechar também
         self.update_dashboard()
+        
+    def open_nfe(self):
+        if not self.ensure("NFE"):
+            return
+        NfeDialog(self.db, self.company_id, self).exec_()
 
     def open_cashflow(self):
         if self.ensure("CONTAS"): CashflowDialog(self.db, self.company_id, self).exec_()
