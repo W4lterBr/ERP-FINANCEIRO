@@ -2739,6 +2739,9 @@ class LoginWindow(QWidget):
         self.btEntrar.setIcon(std_icon(self, self.style().SP_DialogOkButton))
         self.btEntrar.clicked.connect(self.login)
 
+        # ⟵ ADICIONE ESTA LINHA
+        self.edPass.returnPressed.connect(self.btEntrar.click)
+
         self.btEmp = QPushButton("Cadastro de empresa")
         self.btEmp.setIcon(std_icon(self, self.style().SP_ComputerIcon))
         self.btUser = QPushButton("Cadastro de usuário")
@@ -2769,6 +2772,7 @@ class LoginWindow(QWidget):
     def showEvent(self, e):
         super().showEvent(e)
         self.reload_companies()
+        self.edPass.setFocus()
 
     def reload_companies(self, keep_id=None):
         """Recarrega empresas e mantém a atual, se possível."""
