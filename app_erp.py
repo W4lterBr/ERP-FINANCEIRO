@@ -1801,104 +1801,125 @@ class TransactionsDialog(QDialog):
     data_changed = pyqtSignal()  # notifica o dashboard
 
     # --------------------------- helpers visuais ---------------------------
-    def _search_combo_with_button(self):
+    def _search_combo_with_button(self, with_button: bool = True):
         """
-        Retorna (wrap, combo, btn) – um QComboBox com um pequeno botão de 'lupa'
-        acoplado à direita, para ficar parecido com o campo de busca do mock.
+        Retorna (wrap, combo, btn). Quando with_button=False, não cria o botão,
+        ficando só o QComboBox (sem ícone).
         """
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(6)
+
         combo = QComboBox(self)
         combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
-        btn = QPushButton("", self)
-        btn.setFixedSize(28, 28)
-        btn.setIcon(std_icon(self, self.style().SP_FileDialogContentsView))
-        btn.setCursor(Qt.PointingHandCursor)
-        btn.setFocusPolicy(Qt.NoFocus)
+
+        btn = None
+        if with_button:
+            btn = QPushButton("", self)
+            btn.setFixedSize(28, 28)
+            btn.setIcon(std_icon(self, self.style().SP_FileDialogContentsView))
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setFocusPolicy(Qt.NoFocus)
+            row.addWidget(combo, 1)
+            row.addWidget(btn, 0)
+        else:
+            row.addWidget(combo, 1)
+
         wrap = QWidget(self)
         wrap.setLayout(row)
-        row.addWidget(combo, 1)
-        row.addWidget(btn, 0)
         return wrap, combo, btn
 
+    # ------------------------------- init ---------------------------------
     def __init__(self, db: DB, company_id: int, user_id: int, parent=None):
         super().__init__(parent)
         self.db = db
         self.company_id = company_id
         self.user_id = user_id
+        self.current_tx_id = None
+        self._rows_by_id = {}
+
         self.setWindowTitle("Lançamentos")
 
         # ---------- TOPO: título ----------
         outer = QVBoxLayout(self)
         title = QLabel("✓ Lançamentos")
-        f = title.font(); f.setPointSize(14); f.setBold(True)
+        f = title.font()
+        f.setPointSize(14)
+        f.setBold(True)
         title.setFont(f)
         outer.addWidget(title)
 
         # ===================== LINHA SUPERIOR (form + tipo) =====================
-        top_row = QHBoxLayout(); top_row.setSpacing(14); outer.addLayout(top_row)
+        top_row = QHBoxLayout()
+        top_row.setSpacing(14)
+        outer.addLayout(top_row)
 
         # ---------------------- FORM PRINCIPAL (ESQUERDA) ----------------------
         grid = QGridLayout()
         grid.setHorizontalSpacing(10)
         grid.setVerticalSpacing(10)
 
-        # Fornecedor/Cliente
+        # Fornecedor/Cliente (com botão)
         grid.addWidget(QLabel("Fornecedor/Cliente:"), 0, 0)
-        forn_wrap, self.cbEnt, self.btFindEnt = self._search_combo_with_button()
+        forn_wrap, self.cbEnt, self.btFindEnt = self._search_combo_with_button(True)
         grid.addWidget(forn_wrap, 0, 1, 1, 3)
 
         # Datas
         grid.addWidget(QLabel("Data Lançamento:"), 0, 4)
-        self.dtLanc = QDateEdit(QDate.currentDate()); set_br_date(self.dtLanc)
+        self.dtLanc = QDateEdit(QDate.currentDate())
+        set_br_date(self.dtLanc)
         self.dtLanc.setFixedWidth(130)
         grid.addWidget(self.dtLanc, 0, 5)
 
         grid.addWidget(QLabel("Data Vencimento:"), 0, 6)
-        self.dtVenc = QDateEdit(QDate.currentDate()); set_br_date(self.dtVenc)
+        self.dtVenc = QDateEdit(QDate.currentDate())
+        set_br_date(self.dtVenc)
         self.dtVenc.setFixedWidth(130)
         grid.addWidget(self.dtVenc, 0, 7)
 
-        # Categoria
+        # Categoria (SEM botão)
         grid.addWidget(QLabel("Categoria (Classificação da Conta):"), 1, 0, 1, 2)
-        cat_wrap, self.cbCat, self.btFindCat = self._search_combo_with_button()
+        cat_wrap, self.cbCat, _ = self._search_combo_with_button(False)
         grid.addWidget(cat_wrap, 1, 2, 1, 6)
 
-        # Subcategoria
+        # Subcategoria (SEM botão)
         grid.addWidget(QLabel("Subcategoria (Plano de Contas):"), 2, 0, 1, 2)
-        sub_wrap, self.cbSub, self.btFindSub = self._search_combo_with_button()
+        sub_wrap, self.cbSub, _ = self._search_combo_with_button(False)
         grid.addWidget(sub_wrap, 2, 2, 1, 3)
 
         # Valor
         grid.addWidget(QLabel("Valor:"), 2, 5)
-        self.edValor = BRLCurrencyLineEdit(); self.edValor.setValue(0.0)
+        self.edValor = BRLCurrencyLineEdit()
+        self.edValor.setValue(0.0)
         grid.addWidget(self.edValor, 2, 6, 1, 2)
 
         # Forma / Parcelas
         grid.addWidget(QLabel("Forma de Pagamento:"), 3, 0, 1, 2)
-        self.cbForma = QComboBox(); self.cbForma.addItems(["Boleto","PIX","Transferência","Dinheiro","Cartão"])
+        self.cbForma = QComboBox()
+        self.cbForma.addItems(["Boleto", "PIX", "Transferência", "Dinheiro", "Cartão"])
         grid.addWidget(self.cbForma, 3, 2)
 
         grid.addWidget(QLabel("Quantidade de Parcelas:"), 3, 3)
-        self.spParcelas = QSpinBox(); self.spParcelas.setRange(1, 120); self.spParcelas.setValue(1)
+        self.spParcelas = QSpinBox()
+        self.spParcelas.setRange(1, 120)
+        self.spParcelas.setValue(1)
         grid.addWidget(self.spParcelas, 3, 4)
 
-        # Descrição
-        grid.addWidget(QLabel("Descrição do Lançamento:"), 4, 0, 1, 8)
-        self.edDesc = QTextEdit(); self.edDesc.setFixedHeight(64)
+        # Descrição (deixe 6 colunas para não colidir com o Status)
+        grid.addWidget(QLabel("Descrição do Lançamento:"), 4, 0, 1, 6)
+        self.edDesc = QTextEdit()
+        self.edDesc.setFixedHeight(64)
         grid.addWidget(self.edDesc, 5, 0, 1, 6)
 
         # Status (apenas display) + Banco
         grid.addWidget(QLabel("Status:"), 5, 6)
-        self.btnStatus = QPushButton("EM ABERTO"); self.btnStatus.setMinimumHeight(34)
+        self.btnStatus = QPushButton("EM ABERTO")
+        self.btnStatus.setMinimumHeight(34)
         self.btnStatus.setEnabled(False)
         grid.addWidget(self.btnStatus, 5, 7)
 
         grid.addWidget(QLabel("Banco:"), 6, 0)
         self.cbBanco = QComboBox()
-        for b in self.db.banks(self.company_id):
-            self.cbBanco.addItem(f"{b['bank_name']} - {b['account_name'] or ''}", b["id"])
         self.cbBanco.setFixedWidth(220)
         grid.addWidget(self.cbBanco, 6, 1)
 
@@ -1906,55 +1927,77 @@ class TransactionsDialog(QDialog):
         self.btLiquidar = QPushButton("LIQUIDAR")
         self.btCancelar = QPushButton("CANCELAR")
         self.btEditarLinha = QPushButton("EDITAR")
-        act = QHBoxLayout(); act.setSpacing(8)
-        for b, ic in ((self.btLiquidar, self.style().SP_DialogApplyButton),
-                      (self.btCancelar, self.style().SP_DialogCancelButton),
-                      (self.btEditarLinha, self.style().SP_FileDialogDetailedView)):
-            b.setIcon(std_icon(self, ic)); b.setMinimumHeight(34)
+        act = QHBoxLayout()
+        act.setSpacing(8)
+        for b, ic in (
+            (self.btLiquidar, self.style().SP_DialogApplyButton),
+            (self.btCancelar, self.style().SP_DialogCancelButton),
+            (self.btEditarLinha, self.style().SP_FileDialogDetailedView),
+        ):
+            b.setIcon(std_icon(self, ic))
+            b.setMinimumHeight(34)
             act.addWidget(b)
         act.addStretch(1)
         grid.addLayout(act, 6, 2, 1, 6)
 
-        left_wrap = QWidget(); left_wrap.setLayout(grid)
+        left_wrap = QWidget()
+        left_wrap.setLayout(grid)
         top_row.addWidget(left_wrap, 2)
 
         # ---------------------- COLUNA DIREITA (TIPO + SALDOS) -----------------
-        right_col = QVBoxLayout(); right_col.setSpacing(10)
+        right_col = QVBoxLayout()
+        right_col.setSpacing(10)
 
         grpTipo = QGroupBox("Tipo do cadastro")
         v = QVBoxLayout(grpTipo)
         self.rbPagar = QRadioButton("Contas a Pagar")
         self.rbReceber = QRadioButton("Contas a Receber")
         self.rbPagar.setChecked(True)
-        v.addWidget(self.rbPagar); v.addWidget(self.rbReceber)
+        v.addWidget(self.rbPagar)
+        v.addWidget(self.rbReceber)
         right_col.addWidget(grpTipo)
 
         grpSaldo = QGroupBox("")
-        g = QGridLayout(grpSaldo); g.setHorizontalSpacing(10); g.setVerticalSpacing(8)
+        g = QGridLayout(grpSaldo)
+        g.setHorizontalSpacing(10)
+        g.setVerticalSpacing(8)
         g.addWidget(QLabel("Banco:"), 0, 0)
         self.cmbSaldoBanco = QComboBox()
-        for b in self.db.banks(self.company_id):
-            self.cmbSaldoBanco.addItem(f"{b['bank_name']} - {b['account_name'] or ''}", b["id"])
-        self.cmbSaldoBanco.insertItem(0, "", None)
         g.addWidget(self.cmbSaldoBanco, 0, 1)
         g.addWidget(QLabel("Saldo Total Geral:"), 1, 0)
-        self.edSaldoGeral = QLineEdit(); self.edSaldoGeral.setAlignment(Qt.AlignRight); self.edSaldoGeral.setReadOnly(True)
+        self.edSaldoGeral = QLineEdit()
+        self.edSaldoGeral.setAlignment(Qt.AlignRight)
+        self.edSaldoGeral.setReadOnly(True)
         g.addWidget(self.edSaldoGeral, 1, 1)
         g.addWidget(QLabel("Saldo por Banco:"), 2, 0)
-        self.edSaldoBanco = QLineEdit(); self.edSaldoBanco.setAlignment(Qt.AlignRight); self.edSaldoBanco.setReadOnly(True)
+        self.edSaldoBanco = QLineEdit()
+        self.edSaldoBanco.setAlignment(Qt.AlignRight)
+        self.edSaldoBanco.setReadOnly(True)
         g.addWidget(self.edSaldoBanco, 2, 1)
         right_col.addWidget(grpSaldo)
 
         right_col.addStretch(1)
-        right_wrap = QWidget(); right_wrap.setLayout(right_col)
+        right_wrap = QWidget()
+        right_wrap.setLayout(right_col)
         top_row.addWidget(right_wrap, 1)
 
         # ================================ TABELA ================================
-        self.table = QTableWidget(0, 13)
+        self.table = QTableWidget(0, 14)
         headers = [
-            "Status", "Forma de Pagamento", "Valor", "Juros", "Data Liquidação",
-            "Data Vencimento", "Parcelas", "Banco", "Fornecedor/Cliente",
-            "Categoria", "Subcategoria", "Data Lançamento", "Tipo"
+            "Status",
+            "Forma de Pagamento",
+            "Valor",
+            "Juros",
+            "Data Liquidação",
+            "Data Vencimento",
+            "Parcelas",
+            "Banco",
+            "Fornecedor/Cliente",
+            "Categoria",
+            "Subcategoria",
+            "Data Lançamento",
+            "Tipo",
+            "ID",
         ]
         self.table.setHorizontalHeaderLabels(headers)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -1964,40 +2007,49 @@ class TransactionsDialog(QDialog):
         self.table.verticalHeader().setVisible(False)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table.setMinimumHeight(300)
+        self.table.setColumnHidden(13, True)  # esconde ID
 
         table_row = QHBoxLayout()
         table_row.addWidget(self.table, 1)
         self.btAbrir = QPushButton("ABRIR")
         self.btAbrir.setIcon(std_icon(self, self.style().SP_DialogOpenButton))
-        side = QVBoxLayout(); side.addStretch(1); side.addWidget(self.btAbrir)
+        side = QVBoxLayout()
+        side.addStretch(1)
+        side.addWidget(self.btAbrir)
         table_row.addLayout(side)
         outer.addLayout(table_row)
 
         # ============================ FILTROS INFERIORES ========================
-        filtros = QGridLayout(); filtros.setHorizontalSpacing(10); filtros.setVerticalSpacing(10)
-
+        filtros = QGridLayout()
+        filtros.setHorizontalSpacing(10)
+        filtros.setVerticalSpacing(10)
         filtros.addWidget(QLabel("Informe Período:"), 0, 0)
         filtros.addWidget(QLabel("Início:"), 0, 1)
-        self.filIni = QDateEdit(QDate.currentDate().addMonths(-1)); set_br_date(self.filIni)
+        self.filIni = QDateEdit(QDate.currentDate().addMonths(-1))
+        set_br_date(self.filIni)
         filtros.addWidget(self.filIni, 0, 2)
         filtros.addWidget(QLabel("Final:"), 0, 3)
-        self.filFim = QDateEdit(QDate.currentDate()); set_br_date(self.filFim)
+        self.filFim = QDateEdit(QDate.currentDate())
+        set_br_date(self.filFim)
         filtros.addWidget(self.filFim, 0, 4)
 
         filtros.addWidget(QLabel("Tipo do cadastro"), 0, 5)
-        self.cbTipoFiltro = QComboBox(); self.cbTipoFiltro.addItems(["", "Contas a Pagar", "Contas a Receber"])
+        self.cbTipoFiltro = QComboBox()
+        self.cbTipoFiltro.addItems(["", "Contas a Pagar", "Contas a Receber"])
         filtros.addWidget(self.cbTipoFiltro, 0, 6)
 
         filtros.addWidget(QLabel("Status:"), 0, 7)
-        self.cbStatusFiltro = QComboBox(); self.cbStatusFiltro.addItems(["", "EM ABERTO", "LIQUIDADO", "CANCELADO"])
+        self.cbStatusFiltro = QComboBox()
+        self.cbStatusFiltro.addItems(["", "EM ABERTO", "LIQUIDADO", "CANCELADO"])
         filtros.addWidget(self.cbStatusFiltro, 0, 8)
 
         filtros.addWidget(QLabel("Fornecedor/Cliente"), 1, 0, 1, 2)
-        fornF_wrap, self.filForn, _ = self._search_combo_with_button()
+        fornF_wrap, self.filForn, _ = self._search_combo_with_button(True)
         filtros.addWidget(fornF_wrap, 1, 2, 1, 4)
 
         filtros.addWidget(QLabel("Categoria"), 1, 6)
-        self.cbCatFiltro = QComboBox(); filtros.addWidget(self.cbCatFiltro, 1, 7)
+        self.cbCatFiltro = QComboBox()
+        filtros.addWidget(self.cbCatFiltro, 1, 7)
 
         self.btPesquisar = QPushButton("PESQUISAR")
         self.btPesquisar.setIcon(std_icon(self, self.style().SP_FileDialogContentsView))
@@ -2006,30 +2058,43 @@ class TransactionsDialog(QDialog):
         outer.addLayout(filtros)
 
         # ================================ RODAPÉ ================================
-        foot = QHBoxLayout(); foot.setSpacing(10)
-        self.btNovo = QPushButton("  NOVO");   self.btNovo.setIcon(std_icon(self, self.style().SP_FileDialogNewFolder))
-        self.btSalvar = QPushButton("  SALVAR"); self.btSalvar.setIcon(std_icon(self, self.style().SP_DialogSaveButton))
-        self.btEditar = QPushButton("  EDITAR"); self.btEditar.setIcon(std_icon(self, self.style().SP_FileDialogDetailedView))
-        self.btExcluir = QPushButton("  EXCLUIR"); self.btExcluir.setIcon(std_icon(self, self.style().SP_TrashIcon))
+        foot = QHBoxLayout()
+        foot.setSpacing(10)
+        self.btNovo = QPushButton("  NOVO")
+        self.btNovo.setIcon(std_icon(self, self.style().SP_FileDialogNewFolder))
+        self.btSalvar = QPushButton("  SALVAR")
+        self.btSalvar.setIcon(std_icon(self, self.style().SP_DialogSaveButton))
+        self.btEditar = QPushButton("  EDITAR")
+        self.btEditar.setIcon(std_icon(self, self.style().SP_FileDialogDetailedView))
+        self.btExcluir = QPushButton("  EXCLUIR")
+        self.btExcluir.setIcon(std_icon(self, self.style().SP_TrashIcon))
         for b in (self.btNovo, self.btSalvar, self.btEditar, self.btExcluir):
             b.setMinimumHeight(34)
-        foot.addWidget(self.btNovo); foot.addWidget(self.btSalvar); foot.addWidget(self.btEditar); foot.addWidget(self.btExcluir); foot.addStretch(1)
-        btFechar = QPushButton("  FECHAR"); btFechar.setIcon(std_icon(self, self.style().SP_DialogCloseButton)); btFechar.clicked.connect(self.close)
+        foot.addWidget(self.btNovo)
+        foot.addWidget(self.btSalvar)
+        foot.addWidget(self.btEditar)
+        foot.addWidget(self.btExcluir)
+        foot.addStretch(1)
+        btFechar = QPushButton("  FECHAR")
+        btFechar.setIcon(std_icon(self, self.style().SP_DialogCloseButton))
+        btFechar.clicked.connect(self.close)
         foot.addWidget(btFechar)
         outer.addLayout(foot)
 
-        # -------- estilos leves (similar ao mock) --------
-        self.setStyleSheet("""
-            QGroupBox {
-                font-weight: bold; border: 1px solid #D6D6D6; border-radius: 8px;
-                margin-top: 8px; padding: 8px;
-            }
-            QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 2px; }
-            QPushButton { border: 1px solid #d0d0d0; border-radius: 8px; padding: 6px 12px; background: #f7f7f7; }
-            QPushButton:hover { background: #f0f0f0; }
-            QTableWidget { gridline-color: #e2e2e2; }
-            QHeaderView::section { background: #f2f2f2; padding: 6px; border: 1px solid #e0e0e0; }
-        """)
+        # -------- estilos leves --------
+        self.setStyleSheet(
+            """
+        QGroupBox {
+            font-weight: bold; border: 1px solid #D6D6D6; border-radius: 8px;
+            margin-top: 8px; padding: 8px;
+        }
+        QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 2px; }
+        QPushButton { border: 1px solid #d0d0d0; border-radius: 8px; padding: 6px 12px; background: #f7f7f7; }
+        QPushButton:hover { background: #f0f0f0; }
+        QTableWidget { gridline-color: #e2e2e2; }
+        QHeaderView::section { background: #f2f2f2; padding: 6px; border: 1px solid #e0e0e0; }
+        """
+        )
 
         # ====== conexões ======
         self.rbPagar.toggled.connect(self.on_tipo_changed)
@@ -2042,300 +2107,384 @@ class TransactionsDialog(QDialog):
         self.btLiquidar.clicked.connect(self.liquidar)
         self.btCancelar.clicked.connect(self.cancel_selected)
         self.btPesquisar.clicked.connect(self.apply_filters)
+        self.table.itemSelectionChanged.connect(self._update_status_from_selection)
+        self.cbCat.currentIndexChanged.connect(self._load_subcategories_for_form)
+        if self.btFindEnt:
+            self.btFindEnt.clicked.connect(self._open_entities_and_refresh)
+
+        self.cmbSaldoBanco.currentIndexChanged.connect(self._refresh_saldos)
 
         self.populate_static()
         self.load()  # carrega a grade
-        enable_autosize(self, 0.95, 0.9, 1280, 730)
 
-    # ---------------- util ----------------
-    def tipo(self) -> str:
-        return "PAGAR" if self.rbPagar.isChecked() else "RECEBER"
+        # Tamanho inicial pré-definido, mas ainda redimensionável
+        self.resize(1220, 640)
+        try:
+            self.setSizeGripEnabled(True)
+        except Exception:
+            pass
+        self.setWindowFlag(Qt.WindowMaximizeButtonHint, True)
+        self.setWindowFlag(Qt.WindowMinMaxButtonsHint, True)
 
+    # --------------------------- dados estáticos ---------------------------
     def populate_static(self):
-        # bancos já carregados em __init__
-        self.reload_cats_ents()
-        # filtros (cat/forn)
-        self.cbCatFiltro.clear()
-        self.cbCatFiltro.addItem("", None)
-        for c in self.db.categories(self.company_id, "PAGAR"):
-            self.cbCatFiltro.addItem(f"PAGAR - {c['name']}", c["id"])
-        for c in self.db.categories(self.company_id, "RECEBER"):
-            self.cbCatFiltro.addItem(f"RECEBER - {c['name']}", c["id"])
+        # bancos (form + painel saldo)
+        self.cbBanco.blockSignals(True)
+        self.cbBanco.clear()
+        self.cmbSaldoBanco.blockSignals(True)
+        self.cmbSaldoBanco.clear()
+        total = 0.0
+        for b in self.db.banks(self.company_id):
+            label = f"{b['bank_name']} - {b['account_name'] or ''}"
+            self.cbBanco.addItem(label, b["id"])
+            self.cmbSaldoBanco.addItem(label, b["id"])
+            try:
+                total += float(b["current_balance"])
+            except Exception:
+                pass
+        self.cbBanco.blockSignals(False)
+        self.cmbSaldoBanco.insertItem(0, "", None)
+        self.cmbSaldoBanco.setCurrentIndex(0)
+        self.cmbSaldoBanco.blockSignals(False)
+        self.edSaldoGeral.setText(fmt_brl(total))
+        self.edSaldoBanco.setText("")
 
-        self.filForn.clear()
-        for e in self.db.entities(self.company_id):
-            self.filForn.addItem(e["razao_social"], e["id"])
-        self.filForn.insertItem(0, "", None)
-        self.filForn.setCurrentIndex(0)
+        # tipos (entidades/categorias dependem do tipo)
+        self._refresh_entities_by_tipo()
+        self._refresh_categories_by_tipo()
+        self._load_subcategories_for_form()
 
-    def reload_cats_ents(self):
-        # entidades
+        # filtros: fornecedor e categoria
+        self._fill_filter_entities()
+        self._fill_filter_categories()
+
+    def _refresh_entities_by_tipo(self):
+        kind = "FORNECEDOR" if self._current_tipo() == "PAGAR" else "CLIENTE"
         self.cbEnt.clear()
-        kind = "FORNECEDOR" if self.tipo() == "PAGAR" else "CLIENTE"
-        for e in self.db.entities(self.company_id, kind):
+        ents = self.db.entities(self.company_id, kind=kind)
+        self.cbEnt.addItem("", None)
+        for e in ents:
             self.cbEnt.addItem(e["razao_social"], e["id"])
 
-        # categorias
-        self.cbCat.blockSignals(True); self.cbCat.clear()
-        for c in self.db.categories(self.company_id, self.tipo()):
+    def _refresh_categories_by_tipo(self):
+        tipo = self._current_tipo()
+        self.cbCat.clear()
+        cats = self.db.categories(self.company_id, tipo=tipo)
+        self.cbCat.addItem("", None)
+        for c in cats:
             self.cbCat.addItem(c["name"], c["id"])
-        self.cbCat.blockSignals(False)
 
-        try: self.cbCat.currentIndexChanged.disconnect()
-        except TypeError: pass
-        self.cbCat.currentIndexChanged.connect(self.reload_subs)
-        self.reload_subs()
-
-    def reload_subs(self):
+    def _load_subcategories_for_form(self):
         self.cbSub.clear()
         cat_id = self.cbCat.currentData()
-        if not cat_id: return
-        for s in self.db.subcategories(cat_id):
+        if not cat_id:
+            self.cbSub.addItem("", None)
+            return
+        subs = self.db.subcategories(cat_id)
+        self.cbSub.addItem("", None)
+        for s in subs:
             self.cbSub.addItem(s["name"], s["id"])
 
-    def on_tipo_changed(self, _checked: bool):
-        self.reload_cats_ents()
-        self.load()
+    def _fill_filter_entities(self):
+        # lista completa (independente do tipo) para facilitar filtro
+        self.filForn.clear()
+        self.filForn.addItem("", None)
+        for e in self.db.entities(self.company_id):
+            self.filForn.addItem(e["razao_social"], e["id"])
 
-    # ---------------- grade ----------------
-    def _last_payment_date(self, tx_id: int) -> str:
-        r = self.db.q("SELECT payment_date FROM payments WHERE transaction_id=? ORDER BY date(payment_date) DESC LIMIT 1", (tx_id,))
-        return iso_to_br(r[0]["payment_date"]) if r else ""
+    def _fill_filter_categories(self):
+        self.cbCatFiltro.clear()
+        self.cbCatFiltro.addItem("", None)
+        # mostra ambas (PAGAR/RECEBER) para filtro
+        for t in ("PAGAR", "RECEBER"):
+            for c in self.db.categories(self.company_id, t):
+                label = f"{c['name']} [{t}]"
+                self.cbCatFiltro.addItem(label, c["id"])
 
+    def _refresh_saldos(self):
+        # saldo total já preenchido em populate_static; aqui só por banco
+        bank_id = self.cmbSaldoBanco.currentData()
+        if not bank_id:
+            self.edSaldoBanco.setText("")
+            return
+        row = next((b for b in self.db.banks(self.company_id) if b["id"] == bank_id), None)
+        self.edSaldoBanco.setText(fmt_brl(row["current_balance"]) if row else "")
+
+    def _open_entities_and_refresh(self):
+        # abre cadastro para permitir criar/editar e depois recarrega combos
+        EntitiesDialog(self.db, self.company_id, self).exec_()
+        self._refresh_entities_by_tipo()
+        self._fill_filter_entities()
+
+    # --------------------------- util/estado --------------------------------
+    def _current_tipo(self) -> str:
+        return "PAGAR" if self.rbPagar.isChecked() else "RECEBER"
+
+    def _rebuild_name_caches(self):
+        self._ent_name = {r["id"]: r["razao_social"] for r in self.db.entities(self.company_id)}
+        self._cat_name = {r["id"]: r["name"] for r in self.db.categories(self.company_id)}
+        # sub precisa passar por todas categorias
+        self._sub_name = {}
+        for cid in self._cat_name.keys():
+            for s in self.db.subcategories(cid):
+                self._sub_name[s["id"]] = s["name"]
+        self._bank_name = {
+            r["id"]: f"{r['bank_name']} - {r['account_name'] or ''}" for r in self.db.banks(self.company_id)
+        }
+
+    # ------------------------------- carregar -------------------------------
     def load(self):
-        rows = self.db.transactions(self.company_id, self.tipo())
+        self.apply_filters()
+
+    def apply_filters(self):
+        self._rebuild_name_caches()
         self.table.setRowCount(0)
-        widths = [100, 150, 90, 80, 120, 120, 80, 110, 160, 160, 160, 120, 120]
-        for i, w in enumerate(widths): self.table.setColumnWidth(i, w)
+        self._rows_by_id = {}
 
-        for r in rows:
-            row = self.table.rowCount(); self.table.insertRow(row)
+        dt_ini = qdate_to_iso(self.filIni.date())
+        dt_fim = qdate_to_iso(self.filFim.date())
+        tipo_sel = self.cbTipoFiltro.currentText()
+        tipo = None
+        if tipo_sel == "Contas a Pagar":
+            tipo = "PAGAR"
+        elif tipo_sel == "Contas a Receber":
+            tipo = "RECEBER"
 
-            ent = self.db.q("SELECT razao_social FROM entities WHERE id=?", (r["entity_id"],))
-            cat = self.db.q("SELECT name FROM categories WHERE id=?", (r["category_id"],))
-            sub = self.db.q("SELECT name FROM subcategories WHERE id=?", (r["subcategory_id"],))
-            bank = self.db.q("SELECT bank_name||' - '||IFNULL(account_name,'') AS n FROM bank_accounts WHERE id=?", (r["banco_id_padrao"],))
-            status = r["status"]
-            pago = float(r["pago"] or 0.0)
-            if status != "CANCELADO" and pago >= float(r["valor"] or 0.0):
+        rows = self.db.transactions(self.company_id, tipo)
+        ent_filter = self.filForn.currentData()
+        cat_filter = self.cbCatFiltro.currentData()
+        status_filter = self.cbStatusFiltro.currentText() or ""
+
+        for t in rows:
+            # período por vencimento
+            dv = str(t["data_venc"])
+            if not (dt_ini <= dv <= dt_fim):
+                continue
+
+            # calcula status visual
+            valor = float(t["valor"] or 0.0)
+            pago = float(t["pago"] or 0.0)
+            status = t["status"]
+            if status != "CANCELADO" and pago >= valor - 1e-6:
                 status = "LIQUIDADO"
 
-            data = [
-                status,
-                (r["forma_pagto"] or ""),
-                fmt_brl(r["valor"]),
-                fmt_brl(0.0),  # Juros na grade (opcional)
-                self._last_payment_date(r["id"]),
-                iso_to_br(r["data_venc"]),
-                f"01/{int(r['parcelas_qtd'] or 1):02d}",
-                (bank[0]["n"] if bank else ""),
-                (ent[0]["razao_social"] if ent else ""),
-                (cat[0]["name"] if cat else ""),
-                (sub[0]["name"] if sub else ""),
-                iso_to_br(r["data_lanc"]),
-                r["tipo"],
-            ]
-            for c, val in enumerate(data):
-                item = QTableWidgetItem("" if val is None else str(val))
-                if c in (2, 3):
-                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                else:
-                    item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-                self.table.setItem(row, c, item)
+            # filtros adicionais
+            if ent_filter and t["entity_id"] != ent_filter:
+                continue
+            if cat_filter and t["category_id"] != cat_filter:
+                continue
+            if status_filter and status != status_filter:
+                continue
 
-    # ---------------- ações ----------------
+            # juros total e data liquidação (busca rápida nos pagamentos)
+            juros_total = 0.0
+            data_liq = ""
+            try:
+                pays = self.db.payments_for(t["id"])
+                if pays:
+                    juros_total = sum(float(p["interest"] or 0.0) for p in pays)
+                    if status == "LIQUIDADO":
+                        # considera última data de pagamento
+                        data_liq = max(str(p["payment_date"]) for p in pays)
+            except Exception:
+                pass
+
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+
+            def _set(r, c, text):
+                it = QTableWidgetItem("" if text is None else str(text))
+                if c in (2, 3):  # valores à direita
+                    it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                self.table.setItem(r, c, it)
+
+            _set(row, 0, status)
+            _set(row, 1, t["forma_pagto"] or "")
+            _set(row, 2, fmt_brl(valor))
+            _set(row, 3, fmt_brl(juros_total) if juros_total else "")
+            _set(row, 4, iso_to_br(data_liq) if data_liq else "")
+            _set(row, 5, iso_to_br(t["data_venc"]))
+            _set(row, 6, t["parcelas_qtd"])
+            _set(row, 7, self._bank_name.get(t["banco_id_padrao"], "") if t["banco_id_padrao"] else "")
+            _set(row, 8, self._ent_name.get(t["entity_id"], ""))
+            _set(row, 9, self._cat_name.get(t["category_id"], ""))
+            _set(row, 10, self._sub_name.get(t["subcategory_id"], ""))
+            _set(row, 11, iso_to_br(t["data_lanc"]))
+            _set(row, 12, t["tipo"])
+            _set(row, 13, t["id"])  # hidden
+
+            self._rows_by_id[int(t["id"])] = dict(t)
+
+        if self.table.rowCount():
+            self.table.selectRow(0)
+        self._update_status_from_selection()
+
+    # ----------------------------- ações de linha ----------------------------
+    def _selected_tx_id(self):
+        r = self.table.currentRow()
+        if r < 0:
+            return None
+        it = self.table.item(r, 13)
+        if not it:
+            return None
+        try:
+            return int(it.text())
+        except Exception:
+            return None
+
+    def edit_selected(self):
+        tx_id = self._selected_tx_id()
+        if not tx_id:
+            return
+        row = self.db.q("SELECT * FROM transactions WHERE id=?", (tx_id,))
+        if not row:
+            return
+        t = row[0]
+        self.current_tx_id = tx_id
+
+        # tipo
+        if t["tipo"] == "PAGAR":
+            self.rbPagar.setChecked(True)
+        else:
+            self.rbReceber.setChecked(True)
+        # combos dependentes do tipo
+        self._refresh_entities_by_tipo()
+        self._refresh_categories_by_tipo()
+        self._load_subcategories_for_form()
+
+        # campos
+        set_combo_by_data(self.cbEnt, t["entity_id"])
+        self.dtLanc.setDate(QDate.fromString(str(t["data_lanc"]), "yyyy-MM-dd"))
+        self.dtVenc.setDate(QDate.fromString(str(t["data_venc"]), "yyyy-MM-dd"))
+        set_combo_by_data(self.cbCat, t["category_id"])
+        self._load_subcategories_for_form()
+        set_combo_by_data(self.cbSub, t["subcategory_id"])
+        self.edValor.setValue(float(t["valor"] or 0.0))
+        if t["forma_pagto"]:
+            idx = self.cbForma.findText(t["forma_pagto"])
+            if idx < 0:
+                self.cbForma.addItem(t["forma_pagto"])
+                idx = self.cbForma.findText(t["forma_pagto"])
+            self.cbForma.setCurrentIndex(idx)
+        self.spParcelas.setValue(int(t["parcelas_qtd"] or 1))
+        set_combo_by_data(self.cbBanco, t["banco_id_padrao"])
+        self.edDesc.setText(t["descricao"] or "")
+        self.btnStatus.setText(t["status"])
+
+    def delete(self):
+        tx_id = self._selected_tx_id()
+        if not tx_id:
+            return
+        if not msg_yesno("Excluir este lançamento?"):
+            return
+        try:
+            self.db.transaction_delete(tx_id)
+            msg_info("Lançamento excluído.")
+            self.current_tx_id = None
+            self.apply_filters()
+            self.data_changed.emit()
+        except sqlite3.IntegrityError as e:
+            msg_err(str(e), self)
+
+    def cancel_selected(self):
+        tx_id = self._selected_tx_id()
+        if not tx_id:
+            return
+        if not msg_yesno("Cancelar este lançamento?"):
+            return
+        self.db.e("UPDATE transactions SET status='CANCELADO', updated_at=datetime('now') WHERE id=?", (tx_id,))
+        self.apply_filters()
+        self.data_changed.emit()
+
+    def liquidar(self):
+        tx_id = self._selected_tx_id()
+        if not tx_id:
+            return
+        # carrega dados do tx para passar ao diálogo
+        row = self.db.q(
+            "SELECT t.*, IFNULL((SELECT SUM(p.amount + p.interest - p.discount) FROM payments p WHERE p.transaction_id=t.id),0) AS pago "
+            "FROM transactions t WHERE t.id=?", (tx_id,)
+        )
+        if not row:
+            return
+        tx = row[0]
+        dlg = PaymentDialog(self.db, self.company_id, tx, self.user_id, self)
+        if dlg.exec_() and dlg.ok_clicked:
+            # atualiza status se liquidado
+            tot = self.db.q(
+                "SELECT IFNULL(SUM(amount + interest - discount),0) AS tot FROM payments WHERE transaction_id=?",
+                (tx_id,),
+            )[0]["tot"]
+            if float(tot) >= float(tx["valor"] or 0.0) - 1e-6 and (tx["status"] != "CANCELADO"):
+                self.db.e("UPDATE transactions SET status='LIQUIDADO', updated_at=datetime('now') WHERE id=?", (tx_id,))
+            self.apply_filters()
+            self.data_changed.emit()
+
+    # --------------------------- ações do formulário -------------------------
     def new(self):
-        self.edDesc.clear()
-        self.edValor.setValue(0.0)
-        self.spParcelas.setValue(1)
+        self.current_tx_id = None
+        self.rbPagar.setChecked(True)
+        self._refresh_entities_by_tipo()
+        self._refresh_categories_by_tipo()
+        self._load_subcategories_for_form()
+        self.cbEnt.setCurrentIndex(0)
         self.dtLanc.setDate(QDate.currentDate())
         self.dtVenc.setDate(QDate.currentDate())
+        self.cbCat.setCurrentIndex(0)
+        self.cbSub.setCurrentIndex(0)
+        self.edValor.setValue(0.0)
+        self.cbForma.setCurrentIndex(0)
+        self.spParcelas.setValue(1)
+        if self.cbBanco.count():
+            self.cbBanco.setCurrentIndex(0)
+        self.edDesc.clear()
         self.btnStatus.setText("EM ABERTO")
 
     def save(self):
+        tipo = self._current_tipo()
         rec = dict(
             company_id=self.company_id,
-            tipo=self.tipo(),
+            tipo=tipo,
             entity_id=self.cbEnt.currentData(),
             category_id=self.cbCat.currentData(),
             subcategory_id=self.cbSub.currentData(),
-            descricao=self.edDesc.toPlainText(),
+            descricao=self.edDesc.toPlainText().strip(),
             data_lanc=qdate_to_iso(self.dtLanc.date()),
             data_venc=qdate_to_iso(self.dtVenc.date()),
             forma_pagto=self.cbForma.currentText(),
-            parcelas_qtd=int(self.spParcelas.value()),
+            parcelas_qtd=self.spParcelas.value(),
             valor=self.edValor.value(),
             banco_id_padrao=self.cbBanco.currentData(),
             created_by=self.user_id,
         )
+
+        if not rec["category_id"]:
+            msg_err("Selecione a categoria.")
+            return
+
         try:
-            self.db.transaction_save(rec, None)  # novo ou edição (se quiser, guarde editing_tx_id)
+            tx_id = self.db.transaction_save(rec, self.current_tx_id)
+            self.current_tx_id = tx_id
+            msg_info("Lançamento salvo.")
+            self.apply_filters()
+            self.data_changed.emit()
         except sqlite3.IntegrityError as e:
-            msg_err(str(e)); return
-        msg_info("Lançamento salvo.")
-        self.load(); self.data_changed.emit()
+            msg_err(str(e), self)
 
-    def current_tx(self):
-        r = self.table.currentRow()
-        if r < 0: return None
-        # A coluna 12 (Tipo) + outras; recupera pelo par (tipo, data, valor, entidade...)
-        # Preferimos buscar pelo par mais confiável: último id mostrado em consulta auxiliar
-        # (mantemos método original mais robusto quando existir ID na grade)
-        # Aqui, para reaproveitar a infra, consultamos pelo value visível:
-        ent = self.table.item(r, 8).text()
-        desc = self.table.item(r, 9).text()
-        venc = self.table.item(r, 5).text()
-        # Fallback: usa SELECT por aproximação
-        sql = """
-            SELECT t.*, IFNULL((SELECT SUM(p.amount+p.interest-p.discount)
-            FROM payments p WHERE p.transaction_id=t.id),0) AS pago
-            FROM transactions t
-            WHERE t.company_id=? AND date(t.data_venc)=date(?) AND t.tipo=? 
-            AND t.category_id IN (SELECT id FROM categories WHERE name=?)
-            LIMIT 1
-        """
-        rows = self.db.q(sql, (self.company_id, qdate_to_iso(QDate.fromString(venc, "dd/MM/yyyy")), self.table.item(r, 12).text(), desc))
-        if rows: return rows[0]
-        # fallback simples: pega última selecionada em listagem
-        return None
+    # --------------------------- reações de UI -------------------------------
+    def on_tipo_changed(self):
+        # Atualiza combos dependentes do tipo
+        self._refresh_entities_by_tipo()
+        self._refresh_categories_by_tipo()
+        self._load_subcategories_for_form()
 
-    def delete(self):
-        tx = self.current_tx()
-        if not tx: msg_err("Selecione um lançamento."); return
-        if not msg_yesno("Excluir este lançamento?"): return
-        try:
-            self.db.transaction_delete(tx["id"])
-        except sqlite3.IntegrityError as e:
-            msg_err(str(e)); return
-        self.load(); self.data_changed.emit()
-
-    def edit_selected(self):
-        # Mantemos edição usando consulta direta pelo ID (versão mais simples: reconsulta pelo ID da linha selecionada)
+    def _update_status_from_selection(self):
         r = self.table.currentRow()
         if r < 0:
-            msg_err("Selecione um lançamento."); return
-
-        # Achamos o registro pelo par (tipo, venc, valor, fornecedor) – em bases demo funciona bem
-        tipo = self.table.item(r, 12).text()
-        venc = self.table.item(r, 5).text()
-        ent_name = self.table.item(r, 8).text()
-        sql = """
-          SELECT t.*, IFNULL((SELECT SUM(p.amount+p.interest-p.discount) FROM payments p WHERE p.transaction_id=t.id),0) AS pago
-          FROM transactions t
-          JOIN entities e ON e.id=t.entity_id
-          WHERE t.company_id=? AND t.tipo=? AND date(t.data_venc)=date(?) AND e.razao_social=?
-          ORDER BY t.id DESC LIMIT 1
-        """
-        res = self.db.q(sql, (self.company_id, tipo, qdate_to_iso(QDate.fromString(venc, "dd/MM/yyyy")), ent_name))
-        if not res:
-            msg_err("Não foi possível localizar o registro para edição."); return
-        tx = res[0]
-
-        # Preenche o formulário
-        self.rbPagar.blockSignals(True); self.rbReceber.blockSignals(True)
-        self.rbPagar.setChecked(tx["tipo"]=="PAGAR"); self.rbReceber.setChecked(tx["tipo"]=="RECEBER")
-        self.rbPagar.blockSignals(False); self.rbReceber.blockSignals(False)
-        self.reload_cats_ents()
-        set_combo_by_data(self.cbEnt, tx["entity_id"])
-        set_combo_by_data(self.cbCat, tx["category_id"])
-        self.reload_subs(); set_combo_by_data(self.cbSub, tx["subcategory_id"])
-        self.edDesc.setPlainText(tx["descricao"] or "")
-        self.dtLanc.setDate(QDate.fromString(tx["data_lanc"], "yyyy-MM-dd"))
-        self.dtVenc.setDate(QDate.fromString(tx["data_venc"], "yyyy-MM-dd"))
-        self.cbForma.setCurrentText(tx["forma_pagto"] or "Boleto")
-        self.spParcelas.setValue(int(tx["parcelas_qtd"] or 1))
-        set_combo_by_data(self.cbBanco, tx["banco_id_padrao"])
-        self.edValor.setValue(float(tx["valor"]))
-        # status display
-        status = tx["status"]
-        if status != "CANCELADO" and float(tx["pago"] or 0.0) >= float(tx["valor"] or 0.0):
-            status = "LIQUIDADO"
-        self.btnStatus.setText(status)
-
-    def liquidar(self):
-        # Reutiliza o dialog de pagamento já existente
-        tx = self.current_tx()
-        if not tx: msg_err("Selecione um lançamento."); return
-        dlg = PaymentDialog(self.db, self.company_id, tx, self.user_id, self)
-        if dlg.exec_() and dlg.ok_clicked:
-            msg_info("Baixa registrada.")
-            self.load(); self.data_changed.emit()
-
-    def cancel_selected(self):
-        tx = self.current_tx()
-        if not tx: msg_err("Selecione um lançamento."); return
-        if tx["status"] == "CANCELADO":
-            msg_info("Este lançamento já está cancelado."); return
-        if not msg_yesno("Marcar este lançamento como CANCELADO?"): return
-        try:
-            self.db.e("UPDATE transactions SET status='CANCELADO', updated_at=datetime('now') WHERE id=?", (tx["id"],))
-        except sqlite3.IntegrityError as e:
-            msg_err(str(e)); return
-        self.load(); self.data_changed.emit()
-
-    # ---------------- filtros ----------------
-    def apply_filters(self):
-        """
-        Aplica filtros básicos de período / tipo / status / entidade / categoria.
-        (Mantém 'visual' do mock e funciona para usos comuns.)
-        """
-        tipo_txt = self.cbTipoFiltro.currentText()
-        tipo = None
-        if tipo_txt == "Contas a Pagar": tipo = "PAGAR"
-        elif tipo_txt == "Contas a Receber": tipo = "RECEBER"
-
-        status = self.cbStatusFiltro.currentText() or None
-        ent_id = self.filForn.currentData()
-        cat_id = self.cbCatFiltro.currentData()
-
-        sql = """
-            SELECT t.*,
-                   IFNULL((SELECT SUM(p.amount+p.interest-p.discount) FROM payments p WHERE p.transaction_id=t.id),0) AS pago
-            FROM transactions t
-            WHERE t.company_id=? 
-              AND date(t.data_venc) >= date(?) 
-              AND date(t.data_venc) <= date(?)
-        """
-        params = [self.company_id, qdate_to_iso(self.filIni.date()), qdate_to_iso(self.filFim.date())]
-
-        if tipo:
-            sql += " AND t.tipo=?"; params.append(tipo)
-        if ent_id:
-            sql += " AND t.entity_id=?"; params.append(ent_id)
-        if cat_id:
-            sql += " AND t.category_id=?"; params.append(cat_id)
-        if status:
-            sql += " AND t.status=?"; params.append(status)
-
-        sql += " ORDER BY date(t.data_venc)"
-        rows = self.db.q(sql, tuple(params))
-
-        # desenha na grade no mesmo formato do load()
-        self.table.setRowCount(0)
-        for r in rows:
-            row = self.table.rowCount(); self.table.insertRow(row)
-            ent = self.db.q("SELECT razao_social FROM entities WHERE id=?", (r["entity_id"],))
-            cat = self.db.q("SELECT name FROM categories WHERE id=?", (r["category_id"],))
-            sub = self.db.q("SELECT name FROM subcategories WHERE id=?", (r["subcategory_id"],))
-            bank = self.db.q("SELECT bank_name||' - '||IFNULL(account_name,'') AS n FROM bank_accounts WHERE id=?", (r["banco_id_padrao"],))
-            status_row = r["status"]
-            pago = float(r["pago"] or 0.0)
-            if status_row != "CANCELADO" and pago >= float(r["valor"] or 0.0):
-                status_row = "LIQUIDADO"
-            data = [
-                status_row, (r["forma_pagto"] or ""), fmt_brl(r["valor"]), fmt_brl(0.0),
-                self._last_payment_date(r["id"]), iso_to_br(r["data_venc"]),
-                f"01/{int(r['parcelas_qtd'] or 1):02d}", (bank[0]["n"] if bank else ""),
-                (ent[0]["razao_social"] if ent else ""), (cat[0]["name"] if cat else ""),
-                (sub[0]["name"] if sub else ""), iso_to_br(r["data_lanc"]), r["tipo"]
-            ]
-            for c, val in enumerate(data):
-                it = QTableWidgetItem("" if val is None else str(val))
-                if c in (2,3):
-                    it.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                else:
-                    it.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-                self.table.setItem(row, c, it)
+            self.btnStatus.setText("EM ABERTO")
+            return
+        it = self.table.item(r, 0)
+        self.btnStatus.setText(it.text() if it else "EM ABERTO")
 # ======================== FIM DA NOVA TransactionsDialog ======================
 
 class CashflowDialog(QDialog):
