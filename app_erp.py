@@ -2818,6 +2818,30 @@ class NfeDialog(QDialog):
         lay.addLayout(hl)
         enable_autosize(self, 0.4, 0.3, 480, 260)
 
+class EmitirNfeDialog(QDialog):
+    def __init__(self, db: DB, company_id: int, parent=None):
+        super().__init__(parent)
+        self.db = db; self.company_id = company_id
+        self.setWindowTitle("Emitir NFS-e")
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel("Tela de emissão de NFS-e (placeholder)."))
+        bt = QPushButton("Fechar"); bt.clicked.connect(self.close)
+        hl = QHBoxLayout(); hl.addStretch(1); hl.addWidget(bt)
+        lay.addLayout(hl)
+        enable_autosize(self, 0.45, 0.35, 520, 300)
+
+class MonitorXmlDialog(QDialog):
+    def __init__(self, db: DB, company_id: int, parent=None):
+        super().__init__(parent)
+        self.db = db; self.company_id = company_id
+        self.setWindowTitle("Monitor de XML")
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel("Monitor de XML (placeholder)."))
+        btClose = QPushButton("Fechar"); btClose.clicked.connect(self.close)
+        hl = QHBoxLayout(); hl.addStretch(1); hl.addWidget(btClose)
+        lay.addLayout(hl)
+        enable_autosize(self, 0.55, 0.4, 620, 340)
+
 # =============================================================================
 # Login + Main (dashboard)
 # =============================================================================
@@ -2972,11 +2996,15 @@ class MainWindow(QMainWindow):
             mMov = menubar.addMenu("Movimentação")
             for a in mov_actions: mMov.addAction(a)
 
-        # >>> Botão ao lado de Movimentação: Emissão NFS-e (NFE)
+        # >>> Menu ao lado de Movimentação: Emissão NFS-e (NFE)
         if self.has("NFE"):
-            actNfeTop = QAction("Emissão NFS-e (NFE)", self)
-            actNfeTop.triggered.connect(self.open_nfe)
-            menubar.addAction(actNfeTop)
+            mNfe = menubar.addMenu("Emissão NFS-e (NFE)")
+            actEmitir = QAction("Emitir NFS-e", self)
+            actEmitir.triggered.connect(self.open_nfe_emitir)
+            actMonitor = QAction("Monitor de XML", self)
+            actMonitor.triggered.connect(self.open_nfe_monitor)
+            mNfe.addAction(actEmitir)
+            mNfe.addAction(actMonitor)
 
         # ===== Relatórios
         rel_actions = []
@@ -3075,11 +3103,20 @@ class MainWindow(QMainWindow):
         dlg.exec_()
         # garante atualização ao fechar também
         self.update_dashboard()
-        
+
     def open_nfe(self):
         if not self.ensure("NFE"):
             return
         NfeDialog(self.db, self.company_id, self).exec_()
+
+    def open_nfe_emitir(self):
+        if not self.ensure("NFE"): return
+        EmitirNfeDialog(self.db, self.company_id, self).exec_()
+
+    def open_nfe_monitor(self):
+        if not self.ensure("NFE"): return
+        MonitorXmlDialog(self.db, self.company_id, self).exec_()
+
 
     def open_cashflow(self):
         if self.ensure("CONTAS"): CashflowDialog(self.db, self.company_id, self).exec_()
