@@ -1,0 +1,9 @@
+<?xml version='1.0' encoding='utf-8'?>
+<distDFeInt xmlns="http://www.portalfiscal.inf.br/nfe" versao="1.01">
+  <tpAmb>1</tpAmb>
+  <cUFAutor>91</cUFAutor>
+  <CNPJ>99999999999999</CNPJ>
+  <distNSU>
+    <ultNSU>000000000000001</ultNSU>
+  </distNSU>
+</distDFeInt>

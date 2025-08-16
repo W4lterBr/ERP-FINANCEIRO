@@ -8,6 +8,9 @@ import sys
 import csv
 import sqlite3
 import hashlib
+from PyQt5.QtCore import Qt, QDate, QRegExp, QPoint, QSizeF, pyqtSignal, QProcess
+import sys
+from pathlib import Path
 from pathlib import Path
 from datetime import date
 
@@ -145,59 +148,241 @@ class BRLCurrencyLineEdit(QLineEdit):
     def setValue(self, v: float):
         self.setText(fmt_brl(v))
 
+#script -----------------------------
+class NfeCenterDialog(QDialog):
+    """
+    Central NFS-e:
+      - Emitir NFS-e (placeholder)
+      - Monitor de XML  -> executa 'Monitor NF-e.py' (ou alternativas) na mesma pasta
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Emissão NFS-e (NFE)")
+
+        self.btEmitir   = QPushButton("Emitir NFS-e")
+        self.btMonitor  = QPushButton("Monitor de XML")
+
+        for b, ic in (
+            (self.btEmitir,  self.style().SP_FileDialogNewFolder),
+            (self.btMonitor, self.style().SP_ComputerIcon),
+        ):
+            b.setIcon(self.style().standardIcon(ic))
+            b.setMinimumHeight(36)
+
+        self.btEmitir.clicked.connect(self._emitir_nfse)
+        self.btMonitor.clicked.connect(self._abrir_monitor_xml)
+
+        lay = QVBoxLayout(self)
+        lay.addWidget(self.btEmitir)
+        lay.addWidget(self.btMonitor)
+        lay.addStretch(1)
+
+        enable_autosize(self, 0.35, 0.30, 460, 240)
+
+    # --- Ações ---
+    def _emitir_nfse(self):
+        msg_info("Função 'Emitir NFS-e' ainda não implementada.")
+
+    def _abrir_monitor_xml(self):
+        """
+        Procura e executa o script do monitor na mesma pasta do ERP.
+        Aceita nomes comuns:
+          - 'Monitor NF-e.py'
+          - 'Monitor_NF-e.py'
+          - 'MonitorNF-e.py'
+          - 'app_flet_nfe.py' (fallback)
+        """
+        base_dir = Path(__file__).resolve().parent
+        candidatos = [
+            "Monitor NF-e.py",
+            "Monitor_NF-e.py",
+            "MonitorNF-e.py",
+            "app_flet_nfe.py",
+        ]
+
+        script_path = None
+        for nome in candidatos:
+            p = base_dir / nome
+            if p.exists():
+                script_path = p
+                break
+
+        if script_path is None:
+            # Se não encontrou, permite o usuário escolher
+            fn, _ = QFileDialog.getOpenFileName(
+                self,
+                "Localize o Monitor de XML (arquivo .py)",
+                str(base_dir),
+                "Python (*.py)"
+            )
+            if not fn:
+                return
+            script_path = Path(fn)
+
+        # Executa em processo separado, usando o mesmo Python do ERP
+        proc = QProcess(self)
+        proc.setProgram(sys.executable)
+        proc.setArguments([str(script_path)])
+        proc.setWorkingDirectory(str(script_path.parent))
+        ok = proc.startDetached()  # abre a UI do monitor e não bloqueia o ERP
+
+        if not ok:
+            msg_err(f"Não foi possível iniciar o Monitor:\n{script_path}")
+
 # =============================================================================
-# Delegates
+# Delegates (robustos a tipos)
 # =============================================================================
+
 class MaskDelegate(QStyledItemDelegate):
+    """
+    Delegate genérico para QLineEdit com máscara e/ou regex.
+    - Converte qualquer dado para str ao entrar no editor (evita TypeError).
+    - Opcionalmente aplica uppercase na gravação.
+    """
     def __init__(self, mask: str = None, regex: str = None, uppercase: bool = False, parent=None):
-        super().__init__(parent); self.mask=mask; self.regex=regex; self.uppercase=uppercase
+        super().__init__(parent)
+        self.mask = mask
+        self.regex = regex
+        self.uppercase = uppercase
+
     def createEditor(self, parent, option, index):
         ed = QLineEdit(parent)
-        if self.mask: ed.setInputMask(self.mask)
-        if self.regex: ed.setValidator(QRegExpValidator(QRegExp(self.regex), ed))
+        if self.mask:
+            ed.setInputMask(self.mask)
+        if self.regex:
+            ed.setValidator(QRegExpValidator(QRegExp(self.regex), ed))
         return ed
-    def setEditorData(self, editor, index): editor.setText(index.data() or "")
+
+    def setEditorData(self, editor, index):
+        val = index.data()
+        editor.setText("" if val is None else str(val))
+
     def setModelData(self, editor, model, index):
-        text = editor.text().upper() if self.uppercase else editor.text()
+        text = editor.text() or ""
+        if self.uppercase:
+            text = text.upper()
         model.setData(index, text)
 
-class AccountTypeDelegate(QStyledItemDelegate):
+
+class DocNumberDelegate(QStyledItemDelegate):
+    """
+    CNPJ/CPF com formatação automática enquanto digita.
+    - Aceita digitar/colar apenas dígitos (demais caracteres são ignorados).
+    - Formata progressivamente: CPF quando <= 11 dígitos, CNPJ quando > 11 (até 14).
+    - Ao salvar no modelo, mantém o texto já formatado (o seu save já usa only_digits).
+    """
+
+    def createEditor(self, parent, option, index):
+        ed = QLineEdit(parent)
+        # Formata em tempo real sempre que o usuário editar (não dispara em setText por código).
+        ed.textEdited.connect(lambda _=None, e=ed: self._live_format(e))
+        return ed
+
+    def setEditorData(self, editor, index):
+        val = index.data()
+        s = "" if val is None else str(val)
+        # normaliza e aplica formatação ao abrir o editor
+        editor.setText(self._format_progressive(only_digits(s)))
+        editor.setCursorPosition(len(editor.text()))
+
+    def setModelData(self, editor, model, index):
+        # já gravamos formatado (seu save usa only_digits antes de ir ao banco)
+        model.setData(index, editor.text())
+
+    # ---------------- helpers ----------------
+    def _live_format(self, ed: QLineEdit):
+        """Formata enquanto digita e limita a 14 dígitos."""
+        d = only_digits(ed.text())[:14]
+        txt = self._format_progressive(d)
+
+        # evita loops de sinal; textEdited não dispara com setText, mas textChanged sim.
+        blocked = ed.blockSignals(True)
+        ed.setText(txt)
+        ed.blockSignals(blocked)
+        ed.setCursorPosition(len(txt))
+
+    def _format_progressive(self, d: str) -> str:
+        """Escolhe CPF (<=11) ou CNPJ (>11) e formata parcialmente."""
+        if len(d) <= 11:
+            return self._fmt_cpf_live(d)
+        return self._fmt_cnpj_live(d[:14])
+
+    def _fmt_cpf_live(self, d: str) -> str:
+        # padrão CPF: 000.000.000-00 (parcial)
+        n = len(d)
+        if n <= 3:
+            return d
+        if n <= 6:
+            return f"{d[:3]}.{d[3:]}"
+        if n <= 9:
+            return f"{d[:3]}.{d[3:6]}.{d[6:]}"
+        # 10–11
+        return f"{d[:3]}.{d[3:6]}.{d[6:9]}-{d[9:11]}"
+
+    def _fmt_cnpj_live(self, d: str) -> str:
+        # padrão CNPJ: 00.000.000/0000-00 (parcial)
+        n = len(d)
+        if n <= 2:
+            return d
+        if n <= 5:
+            return f"{d[:2]}.{d[2:]}"
+        if n <= 8:
+            return f"{d[:2]}.{d[2:5]}.{d[5:]}"
+        if n <= 12:
+            return f"{d[:2]}.{d[2:5]}.{d[5:8]}/{d[8:]}"
+        # 13–14
+        return f"{d[:2]}.{d[2:5]}.{d[5:8]}/{d[8:12]}-{d[12:14]}"
+
+class KindComboDelegate(QStyledItemDelegate):
+    """
+    Delegate para o campo Tipo na tela de Entidades.
+    Opções: FORNECEDOR, CLIENTE, AMBOS (incluído para compatibilidade com o schema).
+    """
+    OPTIONS = ["FORNECEDOR", "CLIENTE", "AMBOS"]
+
     def createEditor(self, parent, option, index):
         cb = QComboBox(parent)
-        cb.addItems(["CORRENTE", "POUPANÇA"])
+        cb.addItems(self.OPTIONS)
+        cb.setEditable(False)
         return cb
 
     def setEditorData(self, editor, index):
-        val = (index.data() or "").upper()
-        if val not in ("CORRENTE", "POUPANÇA"):
-            val = "CORRENTE"
-        editor.setCurrentText(val)
+        val = index.data()
+        up = ("" if val is None else str(val)).upper()
+        if up not in self.OPTIONS:
+            up = "FORNECEDOR"
+        i = editor.findText(up, Qt.MatchFixedString)
+        editor.setCurrentIndex(0 if i < 0 else i)
 
     def setModelData(self, editor, model, index):
         model.setData(index, editor.currentText())
 
-class DocNumberDelegate(QStyledItemDelegate):
-    def createEditor(self, parent, option, index):
-        ed = QLineEdit(parent)
-        ed.setValidator(QRegExpValidator(QRegExp(r"[0-9\.\-\/]*"), ed))
-        return ed
-    def setEditorData(self, editor, index): editor.setText(index.data() or "")
-    def setModelData(self, editor, model, index):
-        text = editor.text(); d = only_digits(text)
-        if len(d)==11: text = format_cpf(d)
-        elif len(d)==14: text = format_cnpj(d)
-        model.setData(index, text)
 
-class KindComboDelegate(QStyledItemDelegate):
+class AccountTypeDelegate(QStyledItemDelegate):
+    """
+    Delegate para o campo 'Tipo' na tela de Bancos.
+    Opções fixas: Corrente, Poupança. Não permite edição livre.
+    Também normaliza valores antigos (ex.: 'CAIXA', 'CC', 'CP').
+    """
+    OPTIONS = ["Corrente", "Poupança"]
+
     def createEditor(self, parent, option, index):
         cb = QComboBox(parent)
-        cb.addItems(["FORNECEDOR", "CLIENTE"])
+        cb.addItems(self.OPTIONS)
+        cb.setEditable(False)
         return cb
+
     def setEditorData(self, editor, index):
-        val = (index.data() or "").upper()
-        if val not in ("FORNECEDOR", "CLIENTE"):
-            val = "FORNECEDOR"
-        editor.setCurrentText(val)
+        val = index.data()
+        txt = "" if val is None else str(val)
+        up = txt.upper()
+        if up in ("CAIXA", "CORRENTE", "CONTA CORRENTE", "CC", "CTE"):
+            txt = "Corrente"
+        elif up in ("POUPANCA", "POUPANÇA", "CP"):
+            txt = "Poupança"
+        i = editor.findText(txt, Qt.MatchFixedString)
+        editor.setCurrentIndex(0 if i < 0 else i)
+
     def setModelData(self, editor, model, index):
         model.setData(index, editor.currentText())
 
@@ -1506,74 +1691,175 @@ class BanksDialog(QDialog):
 
 class EntitiesDialog(QDialog):
     def __init__(self, db: DB, company_id: int, parent=None):
-        super().__init__(parent); self.db=db; self.company_id=company_id
+        super().__init__(parent)
+        self.db = db
+        self.company_id = company_id
         self.setWindowTitle("Cadastro de Fornecedor / Cliente")
-        self.table=QTableWidget(0,13)
-        self.table.setHorizontalHeaderLabels(["ID","Tipo","CNPJ/CPF","Razão/Nome","Contato1","Contato2","Rua","Bairro","Nº","CEP","UF","Cidade","Email"])
+
+        self.table = QTableWidget(0, 13)
+        self.table.setHorizontalHeaderLabels([
+            "ID","Tipo","CNPJ/CPF","Razão/Nome","Contato1","Contato2",
+            "Rua","Bairro","Nº","CEP","UF","Cidade","Email"
+        ])
         stretch_table(self.table); zebra_table(self.table)
         self.table.setColumnHidden(0, True)
+
+        # Delegates
         self.table.setItemDelegateForColumn(1, KindComboDelegate(self))
         self.table.setItemDelegateForColumn(2, DocNumberDelegate(self))
         self.table.setItemDelegateForColumn(9, MaskDelegate(mask="00000-000", parent=self))
         self.table.setItemDelegateForColumn(10, MaskDelegate(regex=r"[A-Za-z]{0,2}", uppercase=True, parent=self))
-        btAdd=QPushButton("Novo"); btSave=QPushButton("Salvar"); btDel=QPushButton("Excluir"); btReload=QPushButton("Recarregar")
-        for b,ic in ((btAdd,self.style().SP_FileDialogNewFolder),(btSave,self.style().SP_DialogSaveButton),
-                     (btDel,self.style().SP_TrashIcon),(btReload,self.style().SP_BrowserReload)):
+
+        # >>> Ordenação pelo cabeçalho
+        hh = self.table.horizontalHeader()
+        hh.setSectionsClickable(True)
+        hh.setSortIndicatorShown(True)
+        self.table.setSortingEnabled(True)
+
+        # Botões
+        btAdd = QPushButton("Novo")
+        btSave = QPushButton("Salvar")
+        btDel = QPushButton("Excluir")
+        btReload = QPushButton("Recarregar")
+        for b, ic in (
+            (btAdd, self.style().SP_FileDialogNewFolder),
+            (btSave, self.style().SP_DialogSaveButton),
+            (btDel, self.style().SP_TrashIcon),
+            (btReload, self.style().SP_BrowserReload),
+        ):
             b.setIcon(std_icon(self, ic))
-        btAdd.clicked.connect(self.add); btSave.clicked.connect(self.save); btDel.clicked.connect(self.delete); btReload.clicked.connect(self.load)
-        lay=QVBoxLayout(self); lay.addWidget(self.table); hl=QHBoxLayout(); [hl.addWidget(b) for b in (btAdd,btSave,btDel,btReload)]; lay.addLayout(hl)
-        self.load(); enable_autosize(self, 0.85, 0.75, 1100, 650)
+        btAdd.clicked.connect(self.add)
+        btSave.clicked.connect(self.save)
+        btDel.clicked.connect(self.delete)
+        btReload.clicked.connect(self.load)
+
+        lay = QVBoxLayout(self)
+        lay.addWidget(self.table)
+        hl = QHBoxLayout(); [hl.addWidget(b) for b in (btAdd, btSave, btDel, btReload)]
+        lay.addLayout(hl)
+
+        self.load()
+        enable_autosize(self, 0.85, 0.75, 1100, 650)
+
     def load(self):
-        rows = self.db.entities(self.company_id); self.table.setRowCount(0)
+        rows = self.db.entities(self.company_id)
+        # desabilita ordenação durante o preenchimento para acelerar e não reordenar no meio
+        was_sorting = self.table.isSortingEnabled()
+        self.table.setSortingEnabled(False)
+
+        self.table.setRowCount(0)
         for r in rows:
-            row=self.table.rowCount(); self.table.insertRow(row)
-            doc = r["cnpj_cpf"] or ""; d=only_digits(doc)
-            if len(d)==11: doc=format_cpf(d)
-            elif len(d)==14: doc=format_cnpj(d)
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+
+            # formatações de exibição
+            doc = r["cnpj_cpf"] or ""
+            d = only_digits(doc)
+            if len(d) == 11: doc = format_cpf(d)
+            elif len(d) == 14: doc = format_cnpj(d)
+
             cep = r["cep"] or ""
             if cep:
-                dcep=only_digits(cep); cep=f"{dcep[:5]}-{dcep[5:]}" if len(dcep)==8 else cep
-            data=[r["id"], r["kind"], doc, r["razao_social"], r["contato1"], r["contato2"], r["rua"], r["bairro"],
-                  r["numero"], cep, (r["uf"] or ""), r["cidade"], r["email"]]
-            for c,val in enumerate(data):
-                it=QTableWidgetItem("" if val is None else str(val))
-                if c==0: it.setFlags(it.flags() & ~Qt.ItemIsEditable)
-                self.table.setItem(row,c,it)
+                dcep = only_digits(cep)
+                cep = f"{dcep[:5]}-{dcep[5:]}" if len(dcep) == 8 else cep
+
+            data = [
+                r["id"], r["kind"], doc, r["razao_social"], r["contato1"], r["contato2"],
+                r["rua"], r["bairro"], r["numero"], cep, (r["uf"] or ""), r["cidade"], r["email"]
+            ]
+
+            for c, val in enumerate(data):
+                txt = "" if val is None else str(val)
+                it = QTableWidgetItem(txt)
+                if c == 0:  # ID não editável
+                    it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+
+                # --- CNPJ/CPF (ordenar pelos dígitos numéricos)
+                if c == 2:
+                    dig = only_digits(txt)
+                    if dig.isdigit():
+                        it.setData(Qt.UserRole, int(dig))   # chave de ordenação
+                        it.setData(Qt.EditRole, int(dig))   # PyQt5 usa EditRole na ordenação
+
+                # --- Nº (numérico)
+                elif c == 8:
+                    try:
+                        n = int(txt)
+                        it.setData(Qt.UserRole, n)
+                        it.setData(Qt.EditRole, n)
+                    except Exception:
+                        pass
+
+                # --- CEP (ordenar pelos dígitos)
+                elif c == 9:
+                    dig = only_digits(txt)
+                    if dig.isdigit():
+                        it.setData(Qt.UserRole, int(dig))
+                        it.setData(Qt.EditRole, int(dig))
+                self.table.setItem(row, c, it)
+
+        # reabilita ordenação
+        self.table.setSortingEnabled(was_sorting)
+
     def add(self):
-        r=self.table.rowCount(); self.table.insertRow(r); self.table.setItem(r,0,QTableWidgetItem("")); self.table.setItem(r,1,QTableWidgetItem("FORNECEDOR"))
+        r = self.table.rowCount()
+        self.table.insertRow(r)
+        self.table.setItem(r, 0, QTableWidgetItem(""))              # ID vazio
+        self.table.setItem(r, 1, QTableWidgetItem("FORNECEDOR"))    # tipo padrão
+
     def save(self):
         for r in range(self.table.rowCount()):
-            id_txt=self.table.item(r,0).text() if self.table.item(r,0) else ""
-            kind=(self.table.item(r,1).text() if self.table.item(r,1) else "FORNECEDOR").upper()
-            if kind not in ("FORNECEDOR","CLIENTE"): kind="FORNECEDOR"
-            doc=self.table.item(r,2).text() if self.table.item(r,2) else ""
-            d=only_digits(doc)
+            id_txt = self.table.item(r, 0).text() if self.table.item(r, 0) else ""
+            kind = (self.table.item(r, 1).text() if self.table.item(r, 1) else "FORNECEDOR").upper()
+            if kind not in ("FORNECEDOR", "CLIENTE"): kind = "FORNECEDOR"
+
+            doc = self.table.item(r, 2).text() if self.table.item(r, 2) else ""
+            d = only_digits(doc)
             if d:
-                if len(d)==11 and not validate_cpf(d): msg_err(f"CPF inválido (linha {r+1})."); return
-                if len(d)==14 and not validate_cnpj(d): msg_err(f"CNPJ inválido (linha {r+1})."); return
-                if len(d) not in (11,14): msg_err(f"Documento deve ter 11 (CPF) ou 14 (CNPJ) dígitos (linha {r+1})."); return
-            cep=self.table.item(r,9).text() if self.table.item(r,9) else ""
-            uf=self.table.item(r,10).text().upper() if self.table.item(r,10) else ""
+                if len(d) == 11 and not validate_cpf(d): msg_err(f"CPF inválido (linha {r+1})."); return
+                if len(d) == 14 and not validate_cnpj(d): msg_err(f"CNPJ inválido (linha {r+1})."); return
+                if len(d) not in (11, 14): msg_err(f"Documento deve ter 11 (CPF) ou 14 (CNPJ) dígitos (linha {r+1})."); return
+
+            cep = self.table.item(r, 9).text() if self.table.item(r, 9) else ""
+            uf = self.table.item(r,10).text().upper() if self.table.item(r,10) else ""
             if cep and not validate_cep(cep): msg_err(f"CEP inválido (linha {r+1})."); return
             if uf and not validate_uf(uf): msg_err(f"UF inválida (linha {r+1})."); return
-            rec=dict(kind=kind, cnpj_cpf=d, razao_social=self.table.item(r,3).text() if self.table.item(r,3) else "",
-                     contato1=self.table.item(r,4).text() if self.table.item(r,4) else "", contato2=self.table.item(r,5).text() if self.table.item(r,5) else "",
-                     rua=self.table.item(r,6).text() if self.table.item(r,6) else "", bairro=self.table.item(r,7).text() if self.table.item(r,7) else "",
-                     numero=self.table.item(r,8).text() if self.table.item(r,8) else "", cep=only_digits(cep), uf=uf,
-                     cidade=self.table.item(r,11).text() if self.table.item(r,11) else "", email=self.table.item(r,12).text() if self.table.item(r,12) else "",
-                     active=1)
-            if not rec["razao_social"]: msg_err("Razão/Nome é obrigatório."); return
-            eid=int(id_txt) if id_txt.strip().isdigit() else None
-            eid=self.db.entity_save(self.company_id, rec, eid); self.table.setItem(r,0,QTableWidgetItem(str(eid)))
-        msg_info("Registros salvos."); self.load()
+
+            rec = dict(
+                kind=kind, cnpj_cpf=d,
+                razao_social=self.table.item(r,3).text() if self.table.item(r,3) else "",
+                contato1=self.table.item(r,4).text() if self.table.item(r,4) else "",
+                contato2=self.table.item(r,5).text() if self.table.item(r,5) else "",
+                rua=self.table.item(r,6).text() if self.table.item(r,6) else "",
+                bairro=self.table.item(r,7).text() if self.table.item(r,7) else "",
+                numero=self.table.item(r,8).text() if self.table.item(r,8) else "",
+                cep=only_digits(cep), uf=uf,
+                cidade=self.table.item(r,11).text() if self.table.item(r,11) else "",
+                email=self.table.item(r,12).text() if self.table.item(r,12) else "",
+                active=1
+            )
+            if not rec["razao_social"]:
+                msg_err("Razão/Nome é obrigatório."); return
+
+            eid = int(id_txt) if id_txt.strip().isdigit() else None
+            eid = self.db.entity_save(self.company_id, rec, eid)
+            self.table.setItem(r, 0, QTableWidgetItem(str(eid)))
+
+        msg_info("Registros salvos.")
+        self.load()
+
     def delete(self):
-        r=self.table.currentRow()
-        if r<0: return
-        id_txt=self.table.item(r,0).text() if self.table.item(r,0) else ""
-        if not id_txt.strip().isdigit(): self.table.removeRow(r); return
+        r = self.table.currentRow()
+        if r < 0: return
+        id_txt = self.table.item(r, 0).text() if self.table.item(r, 0) else ""
+        if not id_txt.strip().isdigit():
+            self.table.removeRow(r); return
         if not msg_yesno("Excluir este cadastro?"): return
-        try: self.db.entity_delete(int(id_txt))
-        except sqlite3.IntegrityError as e: msg_err(f"Não foi possível excluir. Existem lançamentos vinculados.\n{e}"); return
+        try:
+            self.db.entity_delete(int(id_txt))
+        except sqlite3.IntegrityError as e:
+            msg_err(f"Não foi possível excluir. Existem lançamentos vinculados.\n{e}")
+            return
         self.load()
 
 class CategoriesDialog(QDialog):
@@ -2572,39 +2858,119 @@ class TransactionsDialog(QDialog):
 
 class CashflowDialog(QDialog):
     def __init__(self, db: DB, company_id: int, parent=None):
-        super().__init__(parent); self.db=db; self.company_id=company_id
+        super().__init__(parent)
+        self.db = db
+        self.company_id = company_id
         self.setWindowTitle("Fluxo de Caixa")
-        self.dtIni=QDateEdit(QDate.currentDate().addMonths(-1)); set_br_date(self.dtIni)
-        self.dtFim=QDateEdit(QDate.currentDate()); set_br_date(self.dtFim)
-        self.table=QTableWidget(0,3); self.table.setHorizontalHeaderLabels(["Data","Conta","Valor (efeito)"])
+
+        # período (agora mais largos para não cortar o ano)
+        self.dtIni = QDateEdit(QDate.currentDate().addMonths(-1)); set_br_date(self.dtIni)
+        self.dtIni.setMinimumWidth(140)
+        self.dtFim = QDateEdit(QDate.currentDate());                set_br_date(self.dtFim)
+        self.dtFim.setMinimumWidth(140)
+
+        # seletor de banco
+        self.cbBank = QComboBox()
+        self.cbBank.addItem("Todos", None)
+        for b in self.db.banks(self.company_id):
+            self.cbBank.addItem(f"{b['bank_name']} - {b['account_name'] or ''}", b["id"])
+
+        # tabela com as colunas solicitadas
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels([
+            "Valor", "Tipo", "Data da liquidação",
+            "Fornecedor/Cliente", "Categoria", "Subcategoria"
+        ])
         stretch_table(self.table); zebra_table(self.table)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.lbTotal=QLabel("Total: R$ 0,00")
-        bt=QPushButton("Atualizar"); bt.setIcon(std_icon(self, self.style().SP_BrowserReload)); bt.clicked.connect(self.load)
-        btPdf=QPushButton("Exportar PDF"); btPdf.setIcon(std_icon(self, self.style().SP_DriveDVDIcon))
-        btCsv=QPushButton("Exportar Excel/CSV"); btCsv.setIcon(std_icon(self, self.style().SP_DialogSaveButton))
-        btPdf.clicked.connect(lambda: export_pdf_from_table(self,self.table,"Fluxo_de_Caixa"))
-        btCsv.clicked.connect(lambda: export_excel_from_table(self,self.table,"Fluxo_de_Caixa"))
-        form=QHBoxLayout(); form.addWidget(QLabel("Início:")); form.addWidget(self.dtIni)
-        form.addWidget(QLabel("Fim:")); form.addWidget(self.dtFim); form.addWidget(bt); form.addStretch()
-        lay=QVBoxLayout(self); lay.addLayout(form); lay.addWidget(self.table); lay.addWidget(self.lbTotal)
-        hl=QHBoxLayout(); hl.addWidget(btPdf); hl.addWidget(btCsv); hl.addStretch(); lay.addLayout(hl)
-        self.load(); enable_autosize(self, 0.8, 0.7, 1050, 600)
+
+        # total
+        self.lbTotal = QLabel("Total: R$ 0,00")
+
+        # botões
+        btAtualizar = QPushButton("Atualizar")
+        btAtualizar.setIcon(std_icon(self, self.style().SP_BrowserReload))
+        btPdf = QPushButton("Exportar PDF");       btPdf.setIcon(std_icon(self, self.style().SP_DriveDVDIcon))
+        btCsv = QPushButton("Exportar Excel/CSV"); btCsv.setIcon(std_icon(self, self.style().SP_DialogSaveButton))
+        btPdf.clicked.connect(lambda: export_pdf_from_table(self, self.table, "Fluxo_de_Caixa"))
+        btCsv.clicked.connect(lambda: export_excel_from_table(self, self.table, "Fluxo_de_Caixa"))
+        btAtualizar.clicked.connect(self.load)
+        self.cbBank.currentIndexChanged.connect(self.load)
+
+        # linha superior (período + atualizar + banco)
+        form = QHBoxLayout()
+        form.addWidget(QLabel("Início:")); form.addWidget(self.dtIni)
+        form.addWidget(QLabel("Fim:"));    form.addWidget(self.dtFim)
+        form.addWidget(btAtualizar)
+        form.addSpacing(8)
+        form.addWidget(QLabel("Banco:")); form.addWidget(self.cbBank)
+        form.addStretch()
+
+        # layout
+        lay = QVBoxLayout(self)
+        lay.addLayout(form)
+        lay.addWidget(self.table)
+        lay.addWidget(self.lbTotal)
+        hl = QHBoxLayout(); hl.addWidget(btPdf); hl.addWidget(btCsv); hl.addStretch()
+        lay.addLayout(hl)
+
+        self.load()
+        enable_autosize(self, 0.85, 0.75, 1100, 650)
+
     def load(self):
-        sql = """SELECT data, bank_name||' - '||IFNULL(account_name,'') AS conta, valor_efeito
-                 FROM vw_fluxo_caixa
-                 WHERE company_id=? AND date(data) BETWEEN date(?) AND date(?)
-                 ORDER BY date(data)"""
-        params=(self.company_id, qdate_to_iso(self.dtIni.date()), qdate_to_iso(self.dtFim.date()))
-        rows=self.db.q(sql, params); self.table.setRowCount(0); total=0.0
+        """
+        Lista pagamentos (apenas de lançamentos LIQUIDADOS) no período,
+        com sinal positivo para RECEBER e negativo para PAGAR.
+        Filtro opcional por banco.
+        """
+        dt_ini = qdate_to_iso(self.dtIni.date())
+        dt_fim = qdate_to_iso(self.dtFim.date())
+        bank_id = self.cbBank.currentData()
+
+        sql = """
+            SELECT
+                CASE WHEN t.tipo='RECEBER'
+                     THEN (p.amount + p.interest - p.discount)
+                     ELSE -(p.amount + p.interest - p.discount)
+                END AS valor,
+                t.tipo AS tipo,
+                p.payment_date AS data_liq,
+                IFNULL(e.razao_social,'') AS entidade,
+                IFNULL(c.name,'') AS categoria,
+                IFNULL(s.name,'') AS subcategoria
+            FROM payments p
+            JOIN transactions t     ON t.id = p.transaction_id
+            LEFT JOIN entities e     ON e.id = t.entity_id
+            LEFT JOIN categories c   ON c.id = t.category_id
+            LEFT JOIN subcategories s ON s.id = t.subcategory_id
+            WHERE p.company_id = ?
+              AND date(p.payment_date) BETWEEN date(?) AND date(?)
+              AND t.status = 'LIQUIDADO'
+        """
+        params = [self.company_id, dt_ini, dt_fim]
+        if bank_id:
+            sql += " AND p.bank_id = ?"
+            params.append(bank_id)
+        sql += " ORDER BY date(p.payment_date)"
+
+        rows = self.db.q(sql, tuple(params))
+
+        # preenche tabela
+        self.table.setRowCount(0)
+        total = 0.0
         for r in rows:
-            row=self.table.rowCount(); self.table.insertRow(row)
-            total += float(r["valor_efeito"])
-            self.table.setItem(row,0,QTableWidgetItem(iso_to_br(r["data"])))
-            self.table.setItem(row,1,QTableWidgetItem(r["conta"]))
-            self.table.setItem(row,2,QTableWidgetItem(fmt_brl(r["valor_efeito"])))
+            row = self.table.rowCount(); self.table.insertRow(row)
+            val = float(r["valor"] or 0.0)
+            total += val
+            self.table.setItem(row, 0, QTableWidgetItem(fmt_brl(val)))
+            self.table.setItem(row, 1, QTableWidgetItem(r["tipo"]))
+            self.table.setItem(row, 2, QTableWidgetItem(iso_to_br(r["data_liq"])))
+            self.table.setItem(row, 3, QTableWidgetItem(r["entidade"]))
+            self.table.setItem(row, 4, QTableWidgetItem(r["categoria"]))
+            self.table.setItem(row, 5, QTableWidgetItem(r["subcategoria"]))
+
         self.lbTotal.setText(f"Total: {fmt_brl(total)}")
 
 # ===== [SUBSTITUA A CLASSE DREDialog INTEIRA POR ESTA] ======================
@@ -2958,25 +3324,25 @@ class MainWindow(QMainWindow):
         self.company_id = company_id
         self.user = user_row
 
-        # carrega permissões do usuário
-        self.allowed_codes = self.db.allowed_codes(self.user['id'], self.company_id)
+        # Permissões carregadas para o usuário logado
+        self.allowed_codes = self.db.allowed_codes(self.user["id"], self.company_id)
 
         comp = self.db.q("SELECT razao_social FROM companies WHERE id=?", (company_id,))[0]["razao_social"]
         self.setWindowTitle(f"{APP_TITLE} - {comp}")
 
         menubar = self.menuBar()
 
-        # ===== Cadastros (só cria se houver ação)
+        # ===== Cadastros =====
         cad_actions = []
-        actBanks = QAction("Bancos", self);            actBanks.triggered.connect(self.open_banks)
-        actEnts  = QAction("Fornecedores/Clientes", self); actEnts.triggered.connect(self.open_entities)
-        actCats  = QAction("Categorias/Subcategorias", self); actCats.triggered.connect(self.open_categories)
+        actBanks = QAction("Bancos", self);                    actBanks.triggered.connect(self.open_banks)
+        actEnts  = QAction("Fornecedores/Clientes", self);     actEnts.triggered.connect(self.open_entities)
+        actCats  = QAction("Categorias/Subcategorias", self);  actCats.triggered.connect(self.open_categories)
 
         if self.has("BANCOS"):               cad_actions.append(actBanks)
         if self.has("FORNECEDOR_CLIENTE"):   cad_actions.append(actEnts)
         if self.has("CONTAS"):               cad_actions.append(actCats)
 
-        if self.db.is_admin(self.user['id']):
+        if self.db.is_admin(self.user["id"]):
             actEmpAdmin  = QAction("Empresas (admin)", self); actEmpAdmin.triggered.connect(self.open_companies_admin)
             actUserAdmin = QAction("Usuários (admin)", self);  actUserAdmin.triggered.connect(self.open_users_admin)
             if cad_actions:
@@ -2988,82 +3354,105 @@ class MainWindow(QMainWindow):
             for a in cad_actions:
                 mCad.addSeparator() if a is None else mCad.addAction(a)
 
-        # ===== Movimentação
+        # ===== Movimentação =====
         mov_actions = []
         actTx = QAction("Lançamentos (Pagar/Receber)", self); actTx.triggered.connect(self.open_transactions)
-        if self.has("CONTAS"): mov_actions.append(actTx)
+        if self.has("CONTAS"):
+            mov_actions.append(actTx)
+
+        # Botão/ação para Emissão NFS-e (NFE)
+        actNfe = QAction("Emissão NFS-e (NFE)", self)
+        actNfe.triggered.connect(self.open_nfse_center)
+        if self.has("NFE"):
+            mov_actions.append(actNfe)
+
         if mov_actions:
             mMov = menubar.addMenu("Movimentação")
-            for a in mov_actions: mMov.addAction(a)
+            for a in mov_actions:
+                mMov.addAction(a)
 
-        # >>> Menu ao lado de Movimentação: Emissão NFS-e (NFE)
-        if self.has("NFE"):
-            mNfe = menubar.addMenu("Emissão NFS-e (NFE)")
-            actEmitir = QAction("Emitir NFS-e", self)
-            actEmitir.triggered.connect(self.open_nfe_emitir)
-            actMonitor = QAction("Monitor de XML", self)
-            actMonitor.triggered.connect(self.open_nfe_monitor)
-            mNfe.addAction(actEmitir)
-            mNfe.addAction(actMonitor)
-
-        # ===== Relatórios
+        # ===== Relatórios =====
         rel_actions = []
         actFluxo = QAction("Fluxo de Caixa", self); actFluxo.triggered.connect(self.open_cashflow)
-        actDre   = QAction("DRE", self);           actDre.triggered.connect(self.open_dre)
+        actDre   = QAction("DRE", self);            actDre.triggered.connect(self.open_dre)
+
         if self.has("CONTAS"): rel_actions.append(actFluxo)
         if self.has("DRE"):    rel_actions.append(actDre)
+
         if rel_actions:
             mRel = menubar.addMenu("Relatórios")
-            for a in rel_actions: mRel.addAction(a)
+            for a in rel_actions:
+                mRel.addAction(a)
 
-        # ===== Sair
+        # ===== Sair =====
         actSair = QAction("Sair", self); actSair.triggered.connect(self.close)
         menubar.addAction(actSair)
 
-        # -------- Dashboard
+        # ================== Dashboard ==================
         w = QWidget(); v = QVBoxLayout(w)
+
         title_row = QHBoxLayout()
-        lbTitle = QLabel("Sistema de Gestão Financeira"); lbTitle.setStyleSheet("font-size:26px;font-weight:600;")
-        lbCompany = QLabel(comp); lbCompany.setStyleSheet("font-size:12px;font-style:italic;color:#444;")
+        lbTitle = QLabel("Sistema de Gestão Financeira")
+        lbTitle.setStyleSheet("font-size:26px;font-weight:600;")
+        lbCompany = QLabel(comp)
+        lbCompany.setStyleSheet("font-size:12px;font-style:italic;color:#444;")
         title_row.addWidget(lbTitle); title_row.addStretch(); title_row.addWidget(lbCompany)
         v.addLayout(title_row)
 
         center = QHBoxLayout()
+
+        # Filtros do período
         left = QVBoxLayout(); left.addStretch(1)
         filter_box = QHBoxLayout()
         self.cbMes = QComboBox()
-        self.cbMes.addItems(["Janeiro","Fevereiro","Março","Abril","Maio","Junho","Julho","Agosto","Setembro","Outubro","Novembro","Dezembro"])
-        self.spAno = QSpinBox(); self.spAno.setRange(2000,2099); self.spAno.setValue(date.today().year)
+        self.cbMes.addItems([
+            "Janeiro","Fevereiro","Março","Abril","Maio","Junho",
+            "Julho","Agosto","Setembro","Outubro","Novembro","Dezembro"
+        ])
+        self.spAno = QSpinBox(); self.spAno.setRange(2000, 2099); self.spAno.setValue(date.today().year)
         filter_box.addWidget(QLabel("Período:")); filter_box.addWidget(self.cbMes)
         filter_box.addSpacing(12); filter_box.addWidget(QLabel("Ano:")); filter_box.addWidget(self.spAno)
-        left.addLayout(filter_box); center.addLayout(left,1)
+        left.addLayout(filter_box)
+        center.addLayout(left, 1)
 
+        # Cartões de totais
         right = QVBoxLayout()
         panel = QGroupBox(""); panel_l = QVBoxLayout(panel)
+
         grpR = QGroupBox("Contas a Receber"); lr = QVBoxLayout(grpR)
         self.lbReceber = QLabel("R$ 0,00"); self.lbReceber.setAlignment(Qt.AlignCenter)
-        self.lbReceber.setStyleSheet("QLabel{font-size:28px;font-weight:700;color:#0a8f3c;border:1px solid #999;border-radius:10px;padding:12px;background:#fff;}")
+        self.lbReceber.setStyleSheet(
+            "QLabel{font-size:28px;font-weight:700;color:#0a8f3c;"
+            "border:1px solid #999;border-radius:10px;padding:12px;background:#fff;}"
+        )
         lr.addWidget(self.lbReceber)
+
         grpP = QGroupBox("Contas a Pagar"); lp = QVBoxLayout(grpP)
         self.lbPagar = QLabel("-R$ 0,00"); self.lbPagar.setAlignment(Qt.AlignCenter)
-        self.lbPagar.setStyleSheet("QLabel{font-size:28px;font-weight:700;color:#b32020;border:1px solid #999;border-radius:10px;padding:12px;background:#fff;}")
+        self.lbPagar.setStyleSheet(
+            "QLabel{font-size:28px;font-weight:700;color:#b32020;"
+            "border:1px solid #999;border-radius:10px;padding:12px;background:#fff;}"
+        )
         lp.addWidget(self.lbPagar)
+
         panel_l.addWidget(grpR); panel_l.addWidget(grpP)
-        right.addWidget(panel,3); center.addLayout(right,2)
+        right.addWidget(panel, 3)
+        center.addLayout(right, 2)
+
         v.addLayout(center)
         self.setCentralWidget(w)
 
         self.cbMes.currentIndexChanged.connect(self.update_dashboard)
         self.spAno.valueChanged.connect(self.update_dashboard)
-        self.cbMes.setCurrentIndex(date.today().month-1)
+        self.cbMes.setCurrentIndex(date.today().month - 1)
         self.update_dashboard()
 
         enable_autosize(self, 0.95, 0.9, 1280, 740)
 
-    # ---------- helpers de permissão ----------
+    # ---------- Helpers de permissão ----------
     def has(self, code: str) -> bool:
-        """True se usuário tem a permissão indicada ou for admin."""
-        return self.db.is_admin(self.user['id']) or (code in self.allowed_codes)
+        """True se o usuário tem a permissão indicada ou for admin."""
+        return self.db.is_admin(self.user["id"]) or (code in self.allowed_codes)
 
     def ensure(self, code: str) -> bool:
         if not self.has(code):
@@ -3071,9 +3460,10 @@ class MainWindow(QMainWindow):
             return False
         return True
 
-    # ---------- dashboard ----------
+    # ---------- Dashboard ----------
     def periodo_atual(self):
-        ano = self.spAno.value(); mes = self.cbMes.currentIndex() + 1
+        ano = self.spAno.value()
+        mes = self.cbMes.currentIndex() + 1
         dt_ini = date(ano, mes, 1)
         dt_next = date(ano + (1 if mes == 12 else 0), 1 if mes == 12 else mes + 1, 1)
         return dt_ini.isoformat(), dt_next.isoformat()
@@ -3081,59 +3471,54 @@ class MainWindow(QMainWindow):
     def update_dashboard(self):
         dt_ini, dt_fim_excl = self.periodo_atual()
         resumo = self.db.resumo_periodo(self.company_id, dt_ini, dt_fim_excl)
-        self.lbReceber.setText(fmt_brl(resumo.get('RECEBER', 0.0)))
-        self.lbPagar.setText("-" + fmt_brl(resumo.get('PAGAR', 0.0)).replace("R$ ","R$ "))
+        self.lbReceber.setText(fmt_brl(resumo.get("RECEBER", 0.0)))
+        self.lbPagar.setText("-" + fmt_brl(resumo.get("PAGAR", 0.0)).replace("R$ ", "R$ "))
 
-    # ---------- handlers (checando permissão) ----------
+    # ---------- Aberturas (checando permissão) ----------
     def open_banks(self):
-        if self.ensure("BANCOS"): BanksDialog(self.db, self.company_id, self).exec_()
+        if self.ensure("BANCOS"):
+            BanksDialog(self.db, self.company_id, self).exec_()
 
     def open_entities(self):
-        if self.ensure("FORNECEDOR_CLIENTE"): EntitiesDialog(self.db, self.company_id, self).exec_()
+        if self.ensure("FORNECEDOR_CLIENTE"):
+            EntitiesDialog(self.db, self.company_id, self).exec_()
 
     def open_categories(self):
-        if self.ensure("CONTAS"): CategoriesDialog(self.db, self.company_id, self).exec_()
+        if self.ensure("CONTAS"):
+            CategoriesDialog(self.db, self.company_id, self).exec_()
 
     def open_transactions(self):
         if not self.ensure("CONTAS"):
             return
         dlg = TransactionsDialog(self.db, self.company_id, self.user["id"], self)
-        # atualiza dashboard sempre que houver mudança, mesmo com o diálogo aberto
-        dlg.data_changed.connect(self.update_dashboard)
+        dlg.data_changed.connect(self.update_dashboard)  # atualiza enquanto aberto
         dlg.exec_()
-        # garante atualização ao fechar também
-        self.update_dashboard()
-
-    def open_nfe(self):
-        if not self.ensure("NFE"):
-            return
-        NfeDialog(self.db, self.company_id, self).exec_()
-
-    def open_nfe_emitir(self):
-        if not self.ensure("NFE"): return
-        EmitirNfeDialog(self.db, self.company_id, self).exec_()
-
-    def open_nfe_monitor(self):
-        if not self.ensure("NFE"): return
-        MonitorXmlDialog(self.db, self.company_id, self).exec_()
-
+        self.update_dashboard()  # garante atualização ao fechar
 
     def open_cashflow(self):
-        if self.ensure("CONTAS"): CashflowDialog(self.db, self.company_id, self).exec_()
+        if self.ensure("CONTAS"):
+            CashflowDialog(self.db, self.company_id, self).exec_()
 
     def open_dre(self):
-        if self.ensure("DRE"): DREDialog(self.db, self.company_id, self).exec_()
+        if self.ensure("DRE"):
+            DREDialog(self.db, self.company_id, self).exec_()
 
-    # ---------- admin ----------
     def open_companies_admin(self):
-        if not self.db.is_admin(self.user['id']):
-            msg_err("Somente administrador."); return
+        if not self.db.is_admin(self.user["id"]):
+            msg_err("Somente administrador.")
+            return
         CompaniesDialog(self.db, self).exec_()
 
     def open_users_admin(self):
-        if not self.db.is_admin(self.user['id']):
-            msg_err("Somente administrador."); return
+        if not self.db.is_admin(self.user["id"]):
+            msg_err("Somente administrador.")
+            return
         UsersDialog(self.db, self).exec_()
+
+    def open_nfse_center(self):
+        if not self.ensure("NFE"):
+            return
+        NfeCenterDialog(self).exec_()
 
 # =============================================================================
 def main():
