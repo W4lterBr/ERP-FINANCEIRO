@@ -1,25 +1,12 @@
-# app_erp.py
-# =============================================================================
-# ERP Financeiro - PyQt5 (completo)
-# =============================================================================
-
 import os
 import sys
 import csv
 import sqlite3
 import hashlib
-from PyQt5.QtCore import Qt, QDate, QRegExp, QPoint, QSizeF, pyqtSignal, QProcess
-import sys
-from pathlib import Path
-from pathlib import Path
 from datetime import date
+from pathlib import Path
 
-try:
-    from hmac import compare_digest as secure_eq
-except Exception:
-    from secrets import compare_digest as secure_eq
-
-from PyQt5.QtCore import Qt, QDate, QRegExp, QPoint, QSizeF, pyqtSignal
+from PyQt5.QtCore import Qt, QDate, QRegExp, QPoint, QSizeF, pyqtSignal, QProcess
 from PyQt5.QtGui import QRegExpValidator, QTextDocument
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QLabel, QComboBox, QLineEdit, QPushButton, QHBoxLayout,
@@ -29,6 +16,7 @@ from PyQt5.QtWidgets import (
     QListWidget, QListWidgetItem, QCheckBox, QTextEdit
 )
 from PyQt5.QtPrintSupport import QPrinter
+from hmac import compare_digest as secure_eq
 
 DB_FILE = "erp_financeiro.db"
 APP_TITLE = "ERP Financeiro"
@@ -147,87 +135,6 @@ class BRLCurrencyLineEdit(QLineEdit):
         return parse_brl(self.text())
     def setValue(self, v: float):
         self.setText(fmt_brl(v))
-
-#script -----------------------------
-class NfeCenterDialog(QDialog):
-    """
-    Central NFS-e:
-      - Emitir NFS-e (placeholder)
-      - Monitor de XML  -> executa 'Monitor NF-e.py' (ou alternativas) na mesma pasta
-    """
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Emissão NFS-e (NFE)")
-
-        self.btEmitir   = QPushButton("Emitir NFS-e")
-        self.btMonitor  = QPushButton("Monitor de XML")
-
-        for b, ic in (
-            (self.btEmitir,  self.style().SP_FileDialogNewFolder),
-            (self.btMonitor, self.style().SP_ComputerIcon),
-        ):
-            b.setIcon(self.style().standardIcon(ic))
-            b.setMinimumHeight(36)
-
-        self.btEmitir.clicked.connect(self._emitir_nfse)
-        self.btMonitor.clicked.connect(self._abrir_monitor_xml)
-
-        lay = QVBoxLayout(self)
-        lay.addWidget(self.btEmitir)
-        lay.addWidget(self.btMonitor)
-        lay.addStretch(1)
-
-        enable_autosize(self, 0.35, 0.30, 460, 240)
-
-    # --- Ações ---
-    def _emitir_nfse(self):
-        msg_info("Função 'Emitir NFS-e' ainda não implementada.")
-
-    def _abrir_monitor_xml(self):
-        """
-        Procura e executa o script do monitor na mesma pasta do ERP.
-        Aceita nomes comuns:
-          - 'Monitor NF-e.py'
-          - 'Monitor_NF-e.py'
-          - 'MonitorNF-e.py'
-          - 'app_flet_nfe.py' (fallback)
-        """
-        base_dir = Path(__file__).resolve().parent
-        candidatos = [
-            "Monitor NF-e.py",
-            "Monitor_NF-e.py",
-            "MonitorNF-e.py",
-            "app_flet_nfe.py",
-        ]
-
-        script_path = None
-        for nome in candidatos:
-            p = base_dir / nome
-            if p.exists():
-                script_path = p
-                break
-
-        if script_path is None:
-            # Se não encontrou, permite o usuário escolher
-            fn, _ = QFileDialog.getOpenFileName(
-                self,
-                "Localize o Monitor de XML (arquivo .py)",
-                str(base_dir),
-                "Python (*.py)"
-            )
-            if not fn:
-                return
-            script_path = Path(fn)
-
-        # Executa em processo separado, usando o mesmo Python do ERP
-        proc = QProcess(self)
-        proc.setProgram(sys.executable)
-        proc.setArguments([str(script_path)])
-        proc.setWorkingDirectory(str(script_path.parent))
-        ok = proc.startDetached()  # abre a UI do monitor e não bloqueia o ERP
-
-        if not ok:
-            msg_err(f"Não foi possível iniciar o Monitor:\n{script_path}")
 
 # =============================================================================
 # Delegates (robustos a tipos)
@@ -1811,7 +1718,9 @@ class EntitiesDialog(QDialog):
         for r in range(self.table.rowCount()):
             id_txt = self.table.item(r, 0).text() if self.table.item(r, 0) else ""
             kind = (self.table.item(r, 1).text() if self.table.item(r, 1) else "FORNECEDOR").upper()
-            if kind not in ("FORNECEDOR", "CLIENTE"): kind = "FORNECEDOR"
+            if kind not in ("FORNECEDOR", "CLIENTE", "AMBOS"):
+                kind = "FORNECEDOR"
+
 
             doc = self.table.item(r, 2).text() if self.table.item(r, 2) else ""
             d = only_digits(doc)
@@ -3207,6 +3116,83 @@ class MonitorXmlDialog(QDialog):
         hl = QHBoxLayout(); hl.addStretch(1); hl.addWidget(btClose)
         lay.addLayout(hl)
         enable_autosize(self, 0.55, 0.4, 620, 340)
+# =============================================================================
+# Central NFS-e
+# =============================================================================
+class NfeCenterDialog(QDialog):
+    """
+    Janela com dois botões:
+      - Emitir NFS-e  (placeholder por enquanto)
+      - Monitor de XML (abre automaticamente o 'Monitor NF-e.py' se encontrado)
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Emissão NFS-e (NFE)")
+
+        title = QLabel("Central de NFS-e")
+        f = title.font(); f.setPointSize(14); f.setBold(True)
+        title.setFont(f)
+
+        self.btEmitir  = QPushButton("Emitir NFS-e")
+        self.btMonitor = QPushButton("Monitor de XML")
+
+        # ícones padrão
+        self.btEmitir.setIcon(std_icon(self, self.style().SP_FileDialogDetailedView))
+        self.btMonitor.setIcon(std_icon(self, self.style().SP_ComputerIcon))
+
+        self.btEmitir.clicked.connect(self.open_emitir_nfe)
+        self.btMonitor.clicked.connect(self.open_monitor_xml)
+
+        lay = QVBoxLayout(self)
+        lay.addWidget(title)
+        lay.addSpacing(4)
+        lay.addWidget(self.btEmitir)
+        lay.addWidget(self.btMonitor)
+        lay.addStretch(1)
+
+        # estilo leve + tamanho
+        self.setStyleSheet("""
+            QPushButton { border: 1px solid #d0d0d0; border-radius: 8px; padding: 8px 12px; background:#f7f7f7; }
+            QPushButton:hover { background:#f0f0f0; }
+        """)
+        enable_autosize(self, 0.35, 0.30, 420, 260)
+
+    # -------------------- ações --------------------
+    def open_emitir_nfe(self):
+        # Coloque aqui a integração real quando tiver o emissor.
+        msg_info("Módulo de emissão ainda não configurado nesta versão.", self)
+
+    def open_monitor_xml(self):
+        # Redireciona para o método do MainWindow, que bloqueia o ERP
+        parent = self.parent()
+        if parent and hasattr(parent, "run_monitor_nfe"):
+            self.close()  # opcional: fechar a central
+            parent.run_monitor_nfe()
+            return
+        # Fallback (se aberto isolado, pouco provável)
+        msg_err("Abra o Monitor pelo ERP para bloquear a tela corretamente.", self)
+
+    # -------------------- helpers --------------------
+    def _find_monitor_script(self) -> Path | None:
+        """
+        Procura por 'Monitor NF-e.py' (case-insensitive) na pasta do app e subpastas.
+        """
+        root = Path(__file__).resolve().parent
+
+        # alvos diretos mais comuns
+        direct = root / "Monitor NF-e.py"
+        subdir  = root / "Monitor NF-e" / "Monitor NF-e.py"
+        if direct.exists():
+            return direct
+        if subdir.exists():
+            return subdir
+
+        # busca recursiva case-insensitive
+        target = "monitor nf-e.py"
+        for p in root.rglob("*.py"):
+            if p.name.lower() == target:
+                return p
+        return None
 
 # =============================================================================
 # Login + Main (dashboard)
@@ -3450,75 +3436,140 @@ class MainWindow(QMainWindow):
         enable_autosize(self, 0.95, 0.9, 1280, 740)
 
     # ---------- Helpers de permissão ----------
+    # --- permissões util ---
     def has(self, code: str) -> bool:
-        """True se o usuário tem a permissão indicada ou for admin."""
-        return self.db.is_admin(self.user["id"]) or (code in self.allowed_codes)
+        return code in self.allowed_codes
 
-    def ensure(self, code: str) -> bool:
-        if not self.has(code):
-            msg_err("Você não tem permissão para acessar esta função.")
-            return False
-        return True
-
-    # ---------- Dashboard ----------
-    def periodo_atual(self):
-        ano = self.spAno.value()
-        mes = self.cbMes.currentIndex() + 1
-        dt_ini = date(ano, mes, 1)
-        dt_next = date(ano + (1 if mes == 12 else 0), 1 if mes == 12 else mes + 1, 1)
-        return dt_ini.isoformat(), dt_next.isoformat()
-
-    def update_dashboard(self):
-        dt_ini, dt_fim_excl = self.periodo_atual()
-        resumo = self.db.resumo_periodo(self.company_id, dt_ini, dt_fim_excl)
-        self.lbReceber.setText(fmt_brl(resumo.get("RECEBER", 0.0)))
-        self.lbPagar.setText("-" + fmt_brl(resumo.get("PAGAR", 0.0)).replace("R$ ", "R$ "))
-
-    # ---------- Aberturas (checando permissão) ----------
+    # --- Cadastros ---
     def open_banks(self):
-        if self.ensure("BANCOS"):
-            BanksDialog(self.db, self.company_id, self).exec_()
+        if not self.has("BANCOS"):
+            msg_err("Você não tem permissão para Bancos.", self)
+            return
+        BanksDialog(self.db, self.company_id, self).exec_()
 
     def open_entities(self):
-        if self.ensure("FORNECEDOR_CLIENTE"):
-            EntitiesDialog(self.db, self.company_id, self).exec_()
+        if not self.has("FORNECEDOR_CLIENTE"):
+            msg_err("Você não tem permissão para Fornecedores/Clientes.", self)
+            return
+        EntitiesDialog(self.db, self.company_id, self).exec_()
 
     def open_categories(self):
-        if self.ensure("CONTAS"):
-            CategoriesDialog(self.db, self.company_id, self).exec_()
+        if not self.has("CONTAS"):
+            msg_err("Você não tem permissão para Categorias/Subcategorias.", self)
+            return
+        CategoriesDialog(self.db, self.company_id, self).exec_()
 
+    # --- Movimentação ---
     def open_transactions(self):
-        if not self.ensure("CONTAS"):
+        if not self.has("CONTAS"):
+            msg_err("Você não tem permissão para Lançamentos.", self)
             return
         dlg = TransactionsDialog(self.db, self.company_id, self.user["id"], self)
-        dlg.data_changed.connect(self.update_dashboard)  # atualiza enquanto aberto
+        dlg.data_changed.connect(self.update_dashboard)
         dlg.exec_()
-        self.update_dashboard()  # garante atualização ao fechar
 
     def open_cashflow(self):
-        if self.ensure("CONTAS"):
-            CashflowDialog(self.db, self.company_id, self).exec_()
+        if not self.has("CONTAS"):
+            msg_err("Você não tem permissão para Fluxo de Caixa.", self)
+            return
+        CashflowDialog(self.db, self.company_id, self).exec_()
 
     def open_dre(self):
-        if self.ensure("DRE"):
-            DREDialog(self.db, self.company_id, self).exec_()
+        if not self.has("DRE"):
+            msg_err("Você não tem permissão para DRE.", self)
+            return
+        DREDialog(self.db, self.company_id, self).exec_()
+
+    def open_nfse_center(self):
+        if not self.has("NFE"):
+            msg_err("Você não tem permissão para Emissão NFS-e.", self)
+            return
+        NfeCenterDialog(self).exec_()
 
     def open_companies_admin(self):
         if not self.db.is_admin(self.user["id"]):
-            msg_err("Somente administrador.")
+            msg_err("Apenas administradores podem abrir o cadastro de empresas.", self)
             return
         CompaniesDialog(self.db, self).exec_()
 
     def open_users_admin(self):
         if not self.db.is_admin(self.user["id"]):
-            msg_err("Somente administrador.")
+            msg_err("Apenas administradores podem abrir o cadastro de usuários.", self)
             return
         UsersDialog(self.db, self).exec_()
 
-    def open_nfse_center(self):
-        if not self.ensure("NFE"):
+    # ----------- Monitor NF-e (bloqueia ERP enquanto roda) -----------
+    def run_monitor_nfe(self):
+        script = self._find_monitor_script()
+        if not script:
+            msg_err("Não encontrei o arquivo 'Monitor NF-e.py'. Coloque-o na pasta do ERP (ou subpasta 'Monitor NF-e').", self)
             return
-        NfeCenterDialog(self).exec_()
+
+        # Janela modal simples enquanto o processo roda
+        wait = QDialog(self)
+        wait.setWindowTitle("Monitor NF-e")
+        v = QVBoxLayout(wait)
+        v.addWidget(QLabel(f"Executando: {script.name}\nAguarde o término do processo..."))
+        btn = QPushButton("Cancelar")
+        v.addWidget(btn)
+        wait.setModal(True)
+
+        proc = QProcess(wait)
+
+        def on_finished(*_):
+            wait.accept()
+
+        def on_cancel():
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            wait.reject()
+
+        proc.finished.connect(on_finished)
+        btn.clicked.connect(on_cancel)
+
+        # Inicia
+        proc.start(sys.executable, [str(script)])
+        if not proc.waitForStarted(4000):
+            msg_err("Falha ao iniciar o Monitor NF-e.", self)
+            return
+
+        wait.exec_()  # bloqueia até finalizar/cancelar
+
+    def _find_monitor_script(self) -> Path | None:
+        root = Path(__file__).resolve().parent
+        direct = root / "Monitor NF-e.py"
+        subdir = root / "Monitor NF-e" / "Monitor NF-e.py"
+        if direct.exists():
+            return direct
+        if subdir.exists():
+            return subdir
+        target = "monitor nf-e.py"
+        for p in root.rglob("*.py"):
+            if p.name.lower() == target:
+                return p
+        return None
+
+    # ---------------------- Dashboard ----------------------
+    def update_dashboard(self):
+        # período escolhido
+        mes = self.cbMes.currentIndex() + 1  # 1..12
+        ano = int(self.spAno.value())
+
+        # dt_ini = 1º dia do mês
+        dt_ini = f"{ano:04d}-{mes:02d}-01"
+        # dt_fim_excl = 1º dia do mês seguinte
+        next_m = 1 if mes == 12 else mes + 1
+        next_y = ano + 1 if mes == 12 else ano
+        dt_fim_excl = f"{next_y:04d}-{next_m:02d}-01"
+
+        resumo = self.db.resumo_periodo(self.company_id, dt_ini, dt_fim_excl)
+        receber = float(resumo.get("RECEBER", 0.0))
+        pagar = float(resumo.get("PAGAR", 0.0))
+
+        self.lbReceber.setText(fmt_brl(receber))
+        self.lbPagar.setText("-" + fmt_brl(pagar) if pagar else fmt_brl(0.0))
 
 # =============================================================================
 def main():
@@ -3528,4 +3579,10 @@ def main():
     sys.exit(app.exec_())
 
 if __name__ == "__main__":
-    main()
+    conn = ensure_db()
+    db = DB(conn)
+    app = QApplication(sys.argv)
+    app.setApplicationName(APP_TITLE)
+    w = LoginWindow(db)
+    w.show()
+    sys.exit(app.exec_())
